@@ -1,0 +1,3 @@
+* text=auto
+# cmd.exe misparses LF-only batch files; store with CRLF exactly as-is
+*.cmd -text
