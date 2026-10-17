@@ -212,7 +212,10 @@ function Invoke-Relaunch {
         $file = Join-Path $tempDir 'install.ps1'
         if (-not $script:ScriptText) { throw 'The executing script content is unavailable for relaunch.' }
         [IO.File]::WriteAllText($file, $script:ScriptText, [Text.UTF8Encoding]::new($true))
-        if (-not $bound.ContainsKey('WorkDir')) { $bound['WorkDir'] = $WorkDir }
+        # Pass resolved paths: the child can start elsewhere (elevated processes start in System32).
+        $bound['WorkDir'] = $WorkDir
+        if ($bound.ContainsKey('LogDir')) { $bound['LogDir'] = $LogDir }
+        if ($bound.ContainsKey('DownloadDir')) { $bound['DownloadDir'] = $DownloadDir }
         if (-not $bound.ContainsKey('LogDir')) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
 
         foreach ($key in @($bound.Keys)) {
@@ -240,6 +243,13 @@ function Invoke-Relaunch {
     finally {
         if ($tempDir) { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
+}
+
+function Resolve-UserPath {
+    # Resolve relative paths against the PowerShell location, not the process directory .NET uses.
+    param([AllowNull()][AllowEmptyString()][string] $Path)
+    if (-not $Path) { return $Path }
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
 }
 
 function Get-OsArch {
@@ -375,6 +385,42 @@ function Get-PackageMetadata {
     finally { $zip.Dispose() }
 }
 
+function Get-PackageDependencyState {
+    # Splits a package's dependencies into supplied frameworks it needs and dependencies nothing satisfies.
+    param([Parameter(Mandatory)] $Package, [object[]] $Frameworks)
+    $required = @()
+    $missing = @()
+    foreach ($dep in $Package.Identity.Dependencies) {
+        $supplied = @($Frameworks | Where-Object { $_.Identity.Name -eq $dep.Name -and $_.Identity.Version -ge $dep.MinVersion -and (-not $dep.Publisher -or $_.Identity.Publisher -eq $dep.Publisher) -and ($_.Identity.Arch -eq 'neutral' -or $_.Identity.Arch -eq $dep.Arch) })
+        if ($supplied.Count -gt 0) { $required += $supplied; continue }
+        if ($script:DoProvision) {
+            $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
+            $installed = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
+                $provisionedIdentity = Get-PackageIdentity -FileName ($_.PackageName + '.appx')
+                $provisionedIdentity.Name -eq $dep.Name -and $provisionedIdentity.Version -ge $dep.MinVersion -and (-not $expectedFamily -or $provisionedIdentity.Family -eq $expectedFamily) -and ($provisionedIdentity.Arch -eq 'neutral' -or $provisionedIdentity.Arch -eq $dep.Arch)
+            })
+        }
+        else { $installed = @(Get-AppxPackage -Name $dep.Name -ErrorAction SilentlyContinue | Where-Object { [version]$_.Version -ge $dep.MinVersion -and (-not $dep.Publisher -or $_.Publisher -eq $dep.Publisher) -and ($_.Architecture.ToString() -eq 'Neutral' -or $_.Architecture.ToString() -eq $dep.Arch) }) }
+        if ($installed.Count -eq 0) { $missing += $dep }
+    }
+    return [pscustomobject]@{ Required = $required; Missing = $missing }
+}
+
+function Format-MissingDependency {
+    param([Parameter(Mandatory)] $Dependency, [Parameter(Mandatory)] $Package)
+    return "Missing dependency '$($Dependency.Name)' version $($Dependency.MinVersion) or newer for '$($Package.Identity.Name)' ($($Dependency.Arch))."
+}
+
+function Test-OptionalAppDependency {
+    # Returns $true when an optional app's dependencies are satisfied; otherwise logs them and counts a partial failure.
+    param([Parameter(Mandatory)] $Package, [object[]] $Frameworks)
+    $missing = @((Get-PackageDependencyState -Package $Package -Frameworks $Frameworks).Missing)
+    if ($missing.Count -eq 0) { return $true }
+    foreach ($dep in $missing) { Write-Log "Skipping $($Package.File.Name): $(Format-MissingDependency $dep $Package)" 'WARN' }
+    $script:FailCount++
+    return $false
+}
+
 function Get-DependencyInstallOrder {
     param([object[]] $Frameworks, [object[]] $Applications)
     $ordered = New-Object System.Collections.Generic.List[object]
@@ -383,21 +429,9 @@ function Get-DependencyInstallOrder {
     $allPackages = @($Frameworks) + @($Applications)
     $edges = @{}
     foreach ($pkg in $allPackages) {
-        $required = @()
-        foreach ($dep in $pkg.Identity.Dependencies) {
-            $matches = @($Frameworks | Where-Object { $_.Identity.Name -eq $dep.Name -and $_.Identity.Version -ge $dep.MinVersion -and (-not $dep.Publisher -or $_.Identity.Publisher -eq $dep.Publisher) -and ($_.Identity.Arch -eq 'neutral' -or $_.Identity.Arch -eq $dep.Arch) })
-            if ($matches.Count -gt 0) { $required += $matches; continue }
-            if ($script:DoProvision) {
-                $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
-                $installed = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
-                    $provisionedIdentity = Get-PackageIdentity -FileName ($_.PackageName + '.appx')
-                    $provisionedIdentity.Name -eq $dep.Name -and $provisionedIdentity.Version -ge $dep.MinVersion -and (-not $expectedFamily -or $provisionedIdentity.Family -eq $expectedFamily) -and ($provisionedIdentity.Arch -eq 'neutral' -or $provisionedIdentity.Arch -eq $dep.Arch)
-                })
-            }
-            else { $installed = @(Get-AppxPackage -Name $dep.Name -ErrorAction SilentlyContinue | Where-Object { [version]$_.Version -ge $dep.MinVersion -and (-not $dep.Publisher -or $_.Publisher -eq $dep.Publisher) -and ($_.Architecture.ToString() -eq 'Neutral' -or $_.Architecture.ToString() -eq $dep.Arch) }) }
-            if ($installed.Count -eq 0) { throw "Missing dependency '$($dep.Name)' version $($dep.MinVersion) or newer for '$($pkg.Identity.Name)' ($($dep.Arch)). Add the matching framework package to the package directory." }
-        }
-        $edges[$pkg.File.FullName] = $required
+        $state = Get-PackageDependencyState -Package $pkg -Frameworks $Frameworks
+        if (@($state.Missing).Count -gt 0) { throw "$(Format-MissingDependency @($state.Missing)[0] $pkg) Add the matching framework package to the package directory." }
+        $edges[$pkg.File.FullName] = @($state.Required)
     }
     while ($pending.Count -gt 0) {
         $next = @($pending | Where-Object { $blocked = $false; foreach ($dependency in $edges[$_.File.FullName]) { if ($pending.Contains($dependency)) { $blocked = $true } }; -not $blocked } | Sort-Object { $_.File.Name } | Select-Object -First 1)
@@ -912,6 +946,14 @@ try {
         Write-Host 'ERROR: -DownloadOnly cannot be combined with -Source Local.'
         return 7
     }
+
+    # Resolve paths before any relaunch, which may start in another directory.
+    # WorkDir is empty when run via irm | iex; local packages then come from the current folder only with -Source Local.
+    if (-not $WorkDir -and $Source -eq 'Local') { $WorkDir = (Get-Location).ProviderPath }
+    $WorkDir = Resolve-UserPath $WorkDir
+    $LogDir = Resolve-UserPath $LogDir
+    $DownloadDir = Resolve-UserPath $DownloadDir
+
     if (-not $DownloadOnly -and -not (Test-IsElevated)) {
         if (-not (Test-CanPromptForElevation)) {
             Write-Host 'ERROR: Run this script as Administrator.'
@@ -938,10 +980,7 @@ try {
         return 2
     }
 
-    # WorkDir is empty when run via irm | iex; local packages then come from the current folder only with -Source Local.
-    if (-not $WorkDir -and $Source -eq 'Local') { $WorkDir = (Get-Location).ProviderPath }
     if ($WorkDir) {
-        $WorkDir = [IO.Path]::GetFullPath($WorkDir)
         if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) {
             Write-Host "ERROR: WorkDir not found: $WorkDir"
             return 7
@@ -959,7 +998,7 @@ try {
     $tempLogDir = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs'
     $logName = 'StoreInstall-{0:yyyyMMdd-HHmmss}-{1}.log' -f (Get-Date), ([guid]::NewGuid().ToString('N'))
     $logCandidates = @(
-        $(if ($LogDir) { [IO.Path]::GetFullPath($LogDir) } elseif ($WorkDir) { Join-Path $WorkDir 'Logs' } else { $tempLogDir }),
+        $(if ($LogDir) { $LogDir } elseif ($WorkDir) { Join-Path $WorkDir 'Logs' } else { $tempLogDir }),
         $tempLogDir
     ) | Select-Object -Unique
     foreach ($dir in $logCandidates) {
@@ -1014,7 +1053,7 @@ try {
 
     if ($online) {
         if ($DownloadDir) {
-            $pkgDir = [IO.Path]::GetFullPath($DownloadDir)
+            $pkgDir = $DownloadDir
         }
         else {
             $runToken = [guid]::NewGuid().ToString('N')
@@ -1141,8 +1180,14 @@ try {
         $uniqueFw[$key] = Select-NewerPackage $uniqueFw[$key] $fw
     }
     try {
+        # Optional apps with unmet dependencies are skipped (partial failure) so they cannot block the Store.
+        $fwCandidates = @($uniqueFw.Values)
+        if ($purchase -and -not (Test-OptionalAppDependency $purchase $fwCandidates)) { $purchase = $null }
+        if ($xboxId -and -not (Test-OptionalAppDependency $xboxId $fwCandidates)) { $xboxId = $null }
+        if ($winget -and -not (Test-OptionalAppDependency $winget $fwCandidates)) { $winget = $null }
+        $other = @($other | Where-Object { Test-OptionalAppDependency $_ $fwCandidates })
         $apps = @(@($store, $purchase, $xboxId, $winget) | Where-Object { $null -ne $_ })
-        $sortedFw = @(Get-DependencyInstallOrder -Frameworks @($uniqueFw.Values) -Applications @($apps + @($other.ToArray())))
+        $sortedFw = @(Get-DependencyInstallOrder -Frameworks $fwCandidates -Applications @($apps + $other))
     }
     catch { Write-Log $_.Exception.Message 'ERROR'; return (Complete-Run 4) }
 

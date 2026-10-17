@@ -40,9 +40,9 @@ function New-TestPackage($Name, $Arch = 'x64', $Version = '1.0.0.0', $Dependenci
     } finally { $archive.Dispose() }
     $path
 }
-function Invoke-Flow {
+function Invoke-Flow($WorkDir = $testRoot) {
     $global:ReviewInstallCalls = 0
-    $invocation = @{ Params = @{ WorkDir=$testRoot; LogDir=(Join-Path $testRoot 'Logs'); Source='Local'; DownloadDir=''; DownloadTimeoutSeconds=1; DownloadOnly=$false; KeepDownloads=$false; NoProvision=$true; SkipWinget=$false }; Bound=@{}; ScriptPath=$null; ScriptText='' }
+    $invocation = @{ Params = @{ WorkDir=$WorkDir; LogDir=(Join-Path $testRoot 'Logs'); Source='Local'; DownloadDir=''; DownloadTimeoutSeconds=1; DownloadOnly=$false; KeepDownloads=$false; NoProvision=$true; SkipWinget=$false }; Bound=@{}; ScriptPath=$null; ScriptText='' }
     $result = @(New-Module -Name StoreFlowTest -ArgumentList $invocation -ReturnResult -ScriptBlock $moduleScript)
     return $result[-1]
 }
@@ -54,10 +54,20 @@ try {
     $null = New-TestPackage Microsoft.WindowsStore arm64 9.0.0.0
     $code = Invoke-Flow
     if ($code -ne 0 -or $global:ReviewInstallCalls -ne 4) { throw "Complete mixed-architecture flow expected code0/four installs, got $code / $global:ReviewInstallCalls" }
+    # Relative and implicit -Source Local folders resolve against the PowerShell location, not the process directory.
+    Push-Location -LiteralPath (Split-Path -Parent $testRoot)
+    try { $code = Invoke-Flow (Split-Path -Leaf $testRoot) } finally { Pop-Location }
+    if ($code -ne 0 -or $global:ReviewInstallCalls -ne 4) { throw "Relative WorkDir expected code0/four installs, got $code / $global:ReviewInstallCalls" }
+    Push-Location -LiteralPath $testRoot
+    try { $code = Invoke-Flow '' } finally { Pop-Location }
+    if ($code -ne 0 -or $global:ReviewInstallCalls -ne 4) { throw "Local source without WorkDir expected the current folder, got $code / $global:ReviewInstallCalls" }
+    $null = New-TestPackage Microsoft.XboxIdentityProvider x64 2.0.0.0 '<PackageDependency Name="Missing.Framework" Publisher="CN=Microsoft Corporation" MinVersion="1.0.0.0"/>'
+    $code = Invoke-Flow
+    if ($code -ne 5 -or $global:ReviewInstallCalls -ne 3) { throw "Optional app with a missing dependency must be skipped without blocking the Store, got $code / $global:ReviewInstallCalls" }
     $null = New-TestPackage Microsoft.WindowsStore x64 2.0.0.0 '<PackageDependency Name="Missing.Framework" Publisher="CN=Microsoft Corporation" MinVersion="1.0.0.0"/>'
     $code = Invoke-Flow
     if ($code -ne 4 -or $global:ReviewInstallCalls -ne 0) { throw "Missing dependency should reject before any install, got $code / $global:ReviewInstallCalls" }
-    Write-Host 'PASS: actual installer orchestration reports partial sets, selects usable apps, and rejects missing dependencies before installation.'
+    Write-Host 'PASS: actual installer orchestration resolves relative folders, reports partial sets, selects usable apps, skips optional apps with missing dependencies, and rejects missing Store dependencies before installation.'
 } finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     if ($resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase) -and (Split-Path $resolved -Leaf) -like 'store-flow-test-*') { Remove-Item -LiteralPath $resolved -Recurse -Force }

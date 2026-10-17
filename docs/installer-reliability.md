@@ -26,7 +26,9 @@ Legacy folders without a JSON manifest remain supported. They do not receive the
 
 Local selection skips packages with an unsupported architecture or Windows version before choosing the newest usable app. Equal versions prefer the native architecture. Bundles use their highest-ranked compatible architecture payload for dependency and Windows-version checks.
 
-Frameworks install in dependency order. Before deployment, the script checks required names, publishers, versions, and architectures against the supplied frameworks and applicable installed or provisioned packages. Missing dependencies and cycles stop the run before installation. Keep the complete framework set in an offline folder.
+Frameworks install in dependency order. Before deployment, the script checks required names, publishers, versions, and architectures against the supplied frameworks and applicable installed or provisioned packages. Missing Microsoft Store dependencies and framework cycles stop the run before installation. A companion or additional app with missing dependencies is skipped, and the run reports a partial failure, so it cannot block the Store. Keep the complete framework set in an offline folder.
+
+Relative `-WorkDir`, `-LogDir`, and `-DownloadDir` paths resolve against the current PowerShell location before any relaunch. `-Source Local` without `-WorkDir` uses the current PowerShell location. The elevated or 64-bit child receives the resolved paths.
 
 ## Exit codes
 
@@ -41,6 +43,6 @@ powershell.exe -NoProfile -NonInteractive -File .\tests\Run-Tests.ps1
 pwsh.exe -NoProfile -NonInteractive -File .\tests\Run-Tests.ps1
 ```
 
-The tests use the installer's actual functions and main orchestration with fixture packages and mocked deployment calls. They cover caller scope, relaunch snapshots and arguments, cleanup ownership, package selection, dependencies, offline manifests, incomplete requested sets, and cancellation of a stalled loopback HTTP transfer. GitHub Actions runs the suite under both PowerShell engines.
+The tests use the installer's actual functions and main orchestration with fixture packages and mocked deployment calls. They cover caller scope, relaunch snapshots and arguments, relative path resolution, the command launcher's `-Source` default, cleanup ownership, package selection, dependencies, offline manifests, incomplete requested sets, and cancellation of a stalled loopback HTTP transfer. GitHub Actions runs the suite under both PowerShell engines.
 
 These tests do not install packages or exercise UAC. They do not prove that Microsoft's live delivery service offers an installable package set for a particular LTSC image. Before release, test online and offline installation on disposable LTSC 2021 and LTSC 2024 systems, including SYSTEM provisioning and a new user's first sign-in. Check that Microsoft Store opens, winget runs, and the expected packages register for the intended users.

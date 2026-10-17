@@ -4,7 +4,7 @@ $source = Join-Path $PSScriptRoot '..\install.ps1'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-$names = @('Get-PackageIdentity', 'Get-PublisherId', 'Read-PackageManifest', 'Get-PackageMetadata', 'Get-ArchRank', 'Get-DependencyInstallOrder', 'Select-NewerPackage')
+$names = @('Get-PackageIdentity', 'Get-PublisherId', 'Read-PackageManifest', 'Get-PackageMetadata', 'Get-ArchRank', 'Get-PackageDependencyState', 'Format-MissingDependency', 'Get-DependencyInstallOrder', 'Select-NewerPackage')
 foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { Invoke-Expression $node.Extent.Text }
 }
