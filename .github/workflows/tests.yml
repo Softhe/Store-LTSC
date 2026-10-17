@@ -1,0 +1,23 @@
+name: Installer regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run isolated installer tests
+        shell: pwsh
+        run: |
+          & '${{ matrix.engine }}.exe' -NoProfile -NonInteractive -File ./tests/Run-Tests.ps1
+          exit $LASTEXITCODE

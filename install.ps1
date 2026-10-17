@@ -12,8 +12,8 @@
 
   - Downloads the latest packages straight from Microsoft's Store delivery service
     (displaycatalog.mp.microsoft.com + fe3.delivery.mp.microsoft.com, the same backend the
-    Store app uses). Every file is checked against the SHA-256 published by the service and
-    must carry a valid Microsoft Corporation signature.
+    Store app uses). Every download is checked against the published SHA-256 or SHA-1 hash
+    and must carry a valid Microsoft Corporation signature.
   - Can also install from a local folder of packages (-Source Local / Auto).
   - Non-interactive, CI/MDT/SSH friendly (also runs as SYSTEM: provisions only)
   - Logging with timestamps
@@ -37,7 +37,7 @@
   Local  only use packages in WorkDir.
 
 .PARAMETER DownloadDir
-  Where downloaded packages go. Default: %TEMP%\StoreInstall-Packages (deleted after install
+  Where downloaded packages go. Default: a unique %TEMP%\StoreInstall-Packages-<id> folder (deleted after install
   unless -KeepDownloads). A custom -DownloadDir is always kept.
 
 .PARAMETER DownloadOnly
@@ -47,6 +47,9 @@
 
 .PARAMETER KeepDownloads
   Do not delete the default download folder after installing.
+
+.PARAMETER DownloadTimeoutSeconds
+  Maximum duration of each package download attempt. Default: 1800 seconds.
 
 .PARAMETER NoProvision
   Only Add-AppxPackage for current user (skip Add-AppxProvisionedPackage).
@@ -63,11 +66,11 @@
     1 not elevated (or UAC prompt declined)
     2 unsupported OS build
     3 PowerShell language mode not FullLanguage
-    4 Store package missing
+    4 required package or dependency missing, incompatible, or invalid
     5 partial failure
     6 Store install failed
     7 fatal/internal
-    8 download failed (no internet / Microsoft service unavailable)
+    8 download or download verification failed
 
   Tips:
     1. Needs admin rights; packages are downloaded from Microsoft (or taken from -WorkDir).
@@ -77,12 +80,19 @@
     5. Reboot after clean LTSC/IoT restores before relying on Store/winget.
 #>
 
+& {
+param([object[]] $InvocationArguments, [string] $OriginalScriptPath)
+
+# Keep parameter binding and all implementation variables out of the caller's scope.
+$OriginalScriptText = '#Requires -Version 5.1' + [Environment]::NewLine + '& {' + [Environment]::NewLine + $MyInvocation.MyCommand.ScriptBlock.ToString() + [Environment]::NewLine + '} $args $PSCommandPath'
+function Invoke-StoreLtsc {
 [CmdletBinding()]
 param(
     [string] $WorkDir = $PSScriptRoot,
     [string] $LogDir,
     [ValidateSet('Auto', 'Local', 'Online')][string] $Source = 'Online',
     [string] $DownloadDir,
+    [ValidateRange(1, 86400)][int] $DownloadTimeoutSeconds = 1800,
     [switch] $DownloadOnly,
     [switch] $KeepDownloads,
     [switch] $NoProvision,
@@ -96,11 +106,13 @@ param(
 $StoreLtscInvocation = @{
     Params     = @{
         WorkDir = $WorkDir; LogDir = $LogDir; Source = $Source; DownloadDir = $DownloadDir
+        DownloadTimeoutSeconds = $DownloadTimeoutSeconds
         DownloadOnly = [bool]$DownloadOnly; KeepDownloads = [bool]$KeepDownloads
         NoProvision = [bool]$NoProvision; SkipWinget = [bool]$SkipWinget
     }
     Bound      = @{}
-    ScriptPath = $PSCommandPath
+    ScriptPath = $OriginalScriptPath
+    ScriptText = $OriginalScriptText
 }
 foreach ($kv in $PSBoundParameters.GetEnumerator()) { $StoreLtscInvocation.Bound[$kv.Key] = $kv.Value }
 
@@ -115,12 +127,13 @@ $ProgressPreference = 'SilentlyContinue'   # Appx/DISM progress bars slow down a
 foreach ($kv in $Invocation.Params.GetEnumerator()) { Set-Variable -Name $kv.Key -Value $kv.Value }
 $script:BoundParams = $Invocation.Bound
 $script:ScriptPath = $Invocation.ScriptPath
-$script:SelfUrl = 'https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1'
+$script:ScriptText = $Invocation.ScriptText
 
 $script:LogFile = $null
 $script:FailCount = 0
 $script:LicenseDirs = @()
 $script:CleanupDir = $null
+$script:CleanupToken = $null
 $script:OnlineFrameworkNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
 # Package family names of everything this script installs (looked up in the Store catalog for online mode)
@@ -158,7 +171,17 @@ function Complete-Run {
     param([Parameter(Mandatory)][int] $Code, [string] $Reason)
     if ($script:CleanupDir -and (Test-Path -LiteralPath $script:CleanupDir)) {
         try {
-            Remove-Item -LiteralPath $script:CleanupDir -Recurse -Force
+            $resolved = [IO.Path]::GetFullPath($script:CleanupDir)
+            $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+            $marker = Join-Path $resolved '.store-ltsc-owner'
+            if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                [IO.Path]::GetFileName($resolved) -notmatch '^StoreInstall-Packages-[a-f0-9]{32}$' -or
+                -not $script:CleanupToken -or -not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+                (Get-Content -LiteralPath $marker -Raw).Trim() -ne $script:CleanupToken -or
+                ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Refusing cleanup because the temporary directory ownership check failed.'
+            }
+            Remove-Item -LiteralPath $resolved -Recurse -Force
             Write-Log "Removed downloaded packages: $script:CleanupDir"
         }
         catch { Write-Log "Could not remove ${script:CleanupDir}: $($_.Exception.Message)" 'WARN' }
@@ -182,36 +205,29 @@ function Invoke-Relaunch {
     $null = $bound.Remove('PauseAtEnd')
 
     $tempDir = $null
-    $file = $script:ScriptPath
-    if (-not $file) {
-        # Started via irm | iex: there is no script file to relaunch, so fetch a copy into a private temp folder.
-        $tempDir = Join-Path ([IO.Path]::GetTempPath()) ('Store-LTSC-' + [guid]::NewGuid().ToString('N'))
-        $null = New-Item -ItemType Directory -Path $tempDir -Force
-        $file = Join-Path $tempDir 'install.ps1'
-        Initialize-Network
-        Write-Host "Fetching a copy of the script: $script:SelfUrl"
-        Invoke-WebRequest -Uri $script:SelfUrl -OutFile $file -UseBasicParsing -TimeoutSec 60
-        if (-not $bound.ContainsKey('LogDir')) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
-    }
-
-    $argList = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass')
-    if (-not $Elevate) { $argList += '-NonInteractive' }
-    $argList += '-File', $file
-    foreach ($kv in $bound.GetEnumerator()) {
-        if ($kv.Value -is [System.Management.Automation.SwitchParameter] -or $kv.Value -is [bool]) {
-            if ([bool]$kv.Value) { $argList += "-$($kv.Key)" }
-        }
-        else {
-            $v = [string]$kv.Value
-            if ($v.EndsWith('\')) { $v += '.' }   # avoid a trailing \" escaping the closing quote
-            $argList += "-$($kv.Key)", $v
-        }
-    }
-
     try {
+        # Use the executing revision, including when a local file changes during this run.
+        $tempDir = Join-Path ([IO.Path]::GetTempPath()) ('Store-LTSC-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $tempDir
+        $file = Join-Path $tempDir 'install.ps1'
+        if (-not $script:ScriptText) { throw 'The executing script content is unavailable for relaunch.' }
+        [IO.File]::WriteAllText($file, $script:ScriptText, [Text.UTF8Encoding]::new($true))
+        if (-not $bound.ContainsKey('WorkDir')) { $bound['WorkDir'] = $WorkDir }
+        if (-not $bound.ContainsKey('LogDir')) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
+
+        foreach ($key in @($bound.Keys)) {
+            if ($bound[$key] -is [System.Management.Automation.SwitchParameter]) { $bound[$key] = [bool]$bound[$key] }
+        }
+        if ($Elevate) { $bound['PauseAtEnd'] = $true }
+        # Encode a parameter splat instead of constructing native command-line quoting.
+        $parameterData = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes([Management.Automation.PSSerializer]::Serialize($bound)))
+        $bootstrap = '$parameters = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + $parameterData + '''))); & ''' + $file.Replace("'", "''") + ''' @parameters 6>&1; exit $LASTEXITCODE'
+        $argList = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-InputFormat', 'Text', '-OutputFormat', 'Text')
+        if (-not $Elevate) { $argList += '-NonInteractive' }
+        $argList += '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+
         if ($Elevate) {
-            $argList += '-PauseAtEnd'
-            $cmdLine = ($argList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
+            $cmdLine = $argList -join ' '
             Write-Host 'Requesting administrator rights (UAC). The install continues in a new window...'
             $proc = Start-Process -FilePath $psExe -ArgumentList $cmdLine -Verb RunAs -Wait -PassThru
             Write-Host "Elevated run finished with exit code $($proc.ExitCode)."
@@ -272,6 +288,125 @@ function Get-PackageIdentity {
     }
 }
 
+function Read-PackageManifest {
+    param([Parameter(Mandatory)][IO.Stream] $Stream)
+    $settings = New-Object System.Xml.XmlReaderSettings
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $reader = [System.Xml.XmlReader]::Create($Stream, $settings)
+    try {
+        $xml = New-Object System.Xml.XmlDocument
+        $xml.XmlResolver = $null
+        $xml.Load($reader)
+        return ,$xml
+    }
+    finally { $reader.Dispose() }
+}
+
+function Get-PublisherId {
+    param([Parameter(Mandatory)][string] $Publisher)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([Text.Encoding]::Unicode.GetBytes($Publisher)) } finally { $sha.Dispose() }
+    $alphabet = '0123456789abcdefghjkmnpqrstvwxyz'
+    $bits = ($hash[0..7] | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') }) -join ''
+    $bits += '0'
+    $result = ''
+    for ($i = 0; $i -lt 65; $i += 5) { $result += $alphabet[[Convert]::ToInt32($bits.Substring($i, 5), 2)] }
+    return $result
+}
+
+function Get-PackageMetadata {
+    # Read identities from package contents so renamed offline files remain usable.
+    param([Parameter(Mandatory)][string] $Path, [string] $OsArch, [int] $Build, [int] $Revision = 0)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $manifest = $zip.GetEntry('AppxManifest.xml')
+        if ($manifest) {
+            $stream = $manifest.Open()
+            try { $xml = Read-PackageManifest $stream } finally { $stream.Dispose() }
+            $identity = $xml.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Identity"]')
+            if (-not $identity) { throw "Package identity missing in '$Path'." }
+            $arch = $identity.GetAttribute('ProcessorArchitecture')
+            if (-not $arch) { $arch = 'neutral' }
+            $deps = @($xml.SelectNodes('/*[local-name()="Package"]/*[local-name()="Dependencies"]/*[local-name()="PackageDependency"]') | ForEach-Object {
+                [pscustomobject]@{ Name = $_.GetAttribute('Name'); Publisher = $_.GetAttribute('Publisher'); MinVersion = $(if ($_.GetAttribute('MinVersion')) { [version]$_.GetAttribute('MinVersion') } else { [version]'0.0.0.0' }); Arch = $arch }
+            })
+            $framework = $xml.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Properties"]/*[local-name()="Framework"]')
+            $targets = @($xml.SelectNodes('/*[local-name()="Package"]/*[local-name()="Dependencies"]/*[local-name()="TargetDeviceFamily"]') | Where-Object { $_.GetAttribute('Name') -in @('Windows.Universal', 'Windows.Desktop') })
+            $supported = $targets.Count -eq 0 -or @($targets | Where-Object { -not $_.GetAttribute('MinVersion') -or [version]$_.GetAttribute('MinVersion') -le [version]("10.0.$Build.$Revision") }).Count -gt 0
+            return [pscustomobject]@{ Name = $identity.GetAttribute('Name'); Version = [version]$identity.GetAttribute('Version'); Arch = $arch; Family = ($identity.GetAttribute('Name') + '_' + (Get-PublisherId $identity.GetAttribute('Publisher'))); Publisher = $identity.GetAttribute('Publisher'); IsFramework = ($framework -and $framework.InnerText -eq 'true'); Dependencies = $deps; Supported = $supported }
+        }
+        $manifest = $zip.GetEntry('AppxMetadata/AppxBundleManifest.xml')
+        if (-not $manifest) { throw "No Appx package or bundle manifest in '$Path'." }
+        $stream = $manifest.Open()
+        try { $xml = Read-PackageManifest $stream } finally { $stream.Dispose() }
+        $identity = $xml.SelectSingleNode('/*[local-name()="Bundle"]/*[local-name()="Identity"]')
+        if (-not $identity) { throw "Bundle identity missing in '$Path'." }
+        $payloads = @($xml.SelectNodes('/*[local-name()="Bundle"]/*[local-name()="Packages"]/*[local-name()="Package"]') | Where-Object { $_.GetAttribute('Type') -eq 'application' -and (Get-ArchRank -Arch $_.GetAttribute('Architecture') -OsArch $OsArch -Build $Build) -gt 0 })
+        $best = $payloads | Sort-Object @{ Expression = { Get-ArchRank -Arch $_.GetAttribute('Architecture') -OsArch $OsArch -Build $Build }; Descending = $true } | Select-Object -First 1
+        $deps = @()
+        $supported = $true
+        if ($best) {
+            $entry = $zip.GetEntry($best.GetAttribute('FileName'))
+            if (-not $entry) { throw "Bundle payload '$($best.GetAttribute('FileName'))' missing in '$Path'." }
+            $memory = New-Object IO.MemoryStream
+            $stream = $entry.Open()
+            try { $stream.CopyTo($memory) } finally { $stream.Dispose() }
+            $memory.Position = 0
+            $inner = New-Object IO.Compression.ZipArchive($memory, [IO.Compression.ZipArchiveMode]::Read)
+            try {
+                $entry = $inner.GetEntry('AppxManifest.xml')
+                if (-not $entry) { throw "Bundle payload manifest missing in '$Path'." }
+                $stream = $entry.Open()
+                try { $payloadXml = Read-PackageManifest $stream } finally { $stream.Dispose() }
+                $targets = @($payloadXml.SelectNodes('/*[local-name()="Package"]/*[local-name()="Dependencies"]/*[local-name()="TargetDeviceFamily"]') | Where-Object { $_.GetAttribute('Name') -in @('Windows.Universal', 'Windows.Desktop') })
+                # Check the preferred payload. Do not assume Windows will fall back to an emulated payload.
+                $supported = $targets.Count -eq 0 -or @($targets | Where-Object { -not $_.GetAttribute('MinVersion') -or [version]$_.GetAttribute('MinVersion') -le [version]("10.0.$Build.$Revision") }).Count -gt 0
+                $deps = @($payloadXml.SelectNodes('/*[local-name()="Package"]/*[local-name()="Dependencies"]/*[local-name()="PackageDependency"]') | ForEach-Object {
+                    [pscustomobject]@{ Name = $_.GetAttribute('Name'); Publisher = $_.GetAttribute('Publisher'); MinVersion = $(if ($_.GetAttribute('MinVersion')) { [version]$_.GetAttribute('MinVersion') } else { [version]'0.0.0.0' }); Arch = $best.GetAttribute('Architecture') }
+                })
+            }
+            finally { $inner.Dispose(); $memory.Dispose() }
+        }
+        return [pscustomobject]@{ Name = $identity.GetAttribute('Name'); Version = [version]$identity.GetAttribute('Version'); Arch = $(if ($best) { $best.GetAttribute('Architecture') } else { 'unsupported' }); Family = ($identity.GetAttribute('Name') + '_' + (Get-PublisherId $identity.GetAttribute('Publisher'))); Publisher = $identity.GetAttribute('Publisher'); IsFramework = $false; Dependencies = $deps; Supported = $supported }
+    }
+    finally { $zip.Dispose() }
+}
+
+function Get-DependencyInstallOrder {
+    param([object[]] $Frameworks, [object[]] $Applications)
+    $ordered = New-Object System.Collections.Generic.List[object]
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($pkg in $Frameworks) { $pending.Add($pkg) }
+    $allPackages = @($Frameworks) + @($Applications)
+    $edges = @{}
+    foreach ($pkg in $allPackages) {
+        $required = @()
+        foreach ($dep in $pkg.Identity.Dependencies) {
+            $matches = @($Frameworks | Where-Object { $_.Identity.Name -eq $dep.Name -and $_.Identity.Version -ge $dep.MinVersion -and (-not $dep.Publisher -or $_.Identity.Publisher -eq $dep.Publisher) -and ($_.Identity.Arch -eq 'neutral' -or $_.Identity.Arch -eq $dep.Arch) })
+            if ($matches.Count -gt 0) { $required += $matches; continue }
+            if ($script:DoProvision) {
+                $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
+                $installed = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
+                    $provisionedIdentity = Get-PackageIdentity -FileName ($_.PackageName + '.appx')
+                    $provisionedIdentity.Name -eq $dep.Name -and $provisionedIdentity.Version -ge $dep.MinVersion -and (-not $expectedFamily -or $provisionedIdentity.Family -eq $expectedFamily) -and ($provisionedIdentity.Arch -eq 'neutral' -or $provisionedIdentity.Arch -eq $dep.Arch)
+                })
+            }
+            else { $installed = @(Get-AppxPackage -Name $dep.Name -ErrorAction SilentlyContinue | Where-Object { [version]$_.Version -ge $dep.MinVersion -and (-not $dep.Publisher -or $_.Publisher -eq $dep.Publisher) -and ($_.Architecture.ToString() -eq 'Neutral' -or $_.Architecture.ToString() -eq $dep.Arch) }) }
+            if ($installed.Count -eq 0) { throw "Missing dependency '$($dep.Name)' version $($dep.MinVersion) or newer for '$($pkg.Identity.Name)' ($($dep.Arch)). Add the matching framework package to the package directory." }
+        }
+        $edges[$pkg.File.FullName] = $required
+    }
+    while ($pending.Count -gt 0) {
+        $next = @($pending | Where-Object { $blocked = $false; foreach ($dependency in $edges[$_.File.FullName]) { if ($pending.Contains($dependency)) { $blocked = $true } }; -not $blocked } | Sort-Object { $_.File.Name } | Select-Object -First 1)
+        if ($next.Count -eq 0) { throw "Framework dependency cycle detected: $(($pending | ForEach-Object { $_.Identity.Name }) -join ', ')." }
+        $ordered.Add($next[0]); $null = $pending.Remove($next[0])
+    }
+    return $ordered.ToArray()
+}
+
 function Find-License {
     param(
         [Parameter(Mandatory)][string] $PackagePath,
@@ -328,24 +463,12 @@ function Get-ArchRank {
     return 0
 }
 
-function Get-FrameworkSortKey {
-    param([string] $Name)
-    $l = $Name.ToLowerInvariant()
-    if ($l -match 'vclibs\.140\.00\.uwpdesktop') { return 10 }
-    if ($l -match 'vclibs') { return 20 }
-    if ($l -match 'net\.native\.framework') { return 30 }
-    if ($l -match 'net\.native\.runtime') { return 40 }
-    if ($l -match 'ui\.xaml') { return 50 }
-    if ($l -match 'windowsappruntime') { return 60 }
-    return 80
-}
-
 function Select-NewerPackage {
     param($Current, [Parameter(Mandatory)] $Candidate)
     if (-not $Current) { return $Candidate }
     $curVer = if ($Current.Identity.Version) { $Current.Identity.Version } else { [version]'0.0' }
     $candVer = if ($Candidate.Identity.Version) { $Candidate.Identity.Version } else { [version]'0.0' }
-    $keep, $drop = if ($candVer -gt $curVer) { $Candidate, $Current } else { $Current, $Candidate }
+    $keep, $drop = if ($candVer -gt $curVer -or ($candVer -eq $curVer -and $Candidate.Rank -gt $Current.Rank)) { $Candidate, $Current } else { $Current, $Candidate }
     Write-Log "Multiple packages for $($keep.Identity.Name); using $($keep.File.Name), ignoring $($drop.File.Name)" 'WARN'
     return $keep
 }
@@ -606,6 +729,58 @@ function Test-PackageFile {
     return $null
 }
 
+function Save-PackageDownload {
+    param([string] $Url, [string] $Path, [int] $TimeoutSeconds = 1800)
+    # Cancellation aborts the underlying request before the client and temporary file are released.
+    $client = New-Object Net.WebClient
+    try {
+        $task = $client.DownloadFileTaskAsync([uri]$Url, $Path)
+        if (-not $task.Wait([TimeSpan]::FromSeconds($TimeoutSeconds))) {
+            $client.CancelAsync()
+            try { $task.GetAwaiter().GetResult() } catch { }
+            throw "Download exceeded the $TimeoutSeconds second time limit"
+        }
+        $task.GetAwaiter().GetResult()
+    }
+    finally { $client.CancelAsync(); $client.Dispose() }
+}
+
+function Test-OfflineManifest {
+    param([string] $Directory, [string] $OsArch, [int] $Build, [string[]] $Families)
+    $manifestPath = Join-Path $Directory 'store-packages.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.SchemaVersion -ne 1) { throw 'Unsupported offline package manifest schema' }
+    if ($manifest.OsArch -ne $OsArch) { throw "Offline packages target $($manifest.OsArch), not $OsArch" }
+    foreach ($family in $Families) {
+        if (@($manifest.RequestedFamilies) -notcontains $family) { throw "Offline manifest does not include requested app $family" }
+        if (@($manifest.MissingFamilies) -contains $family) { throw "Offline package manifest records a missing requested app: $family" }
+    }
+    $seen = @{}
+    $files = foreach ($entry in $manifest.Files) {
+        $name = [string]$entry.Name
+        if (-not $name -or $name -match '[\\/:*?"<>|]' -or $name -eq '.' -or $name -eq '..' -or
+            [IO.Path]::GetFileName($name) -ne $name -or $seen.ContainsKey($name) -or
+            [IO.Path]::GetExtension($name) -notin @('.appx', '.msix', '.appxbundle', '.msixbundle')) {
+            throw "Invalid or duplicate filename in offline manifest: $name"
+        }
+        $seen[$name] = $true
+        $file = Get-Item -LiteralPath (Join-Path $Directory $name) -ErrorAction Stop
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Offline package must be a regular file: $name" }
+        if ($entry.Sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or $file.Length -ne $entry.Size -or
+            (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ne $entry.Sha256) { throw "Offline package hash or size mismatch: $name" }
+        # A user-editable manifest detects corruption. Microsoft signatures establish package authenticity.
+        $sig = Get-AuthenticodeSignature -LiteralPath $file.FullName
+        if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or $sig.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') {
+            throw "Offline package does not have a valid Microsoft signature: $name"
+        }
+        $file
+    }
+    if (@($files).Count -eq 0) { throw 'Offline package manifest has no files' }
+    Write-Log "Verified offline manifest: $(@($files).Count) package(s), SHA256 and Microsoft signatures"
+    $files
+}
+
 function Save-OnlinePackages {
     # Resolves, selects and downloads packages for the given families. Returns the downloaded FileInfo objects.
     param(
@@ -619,6 +794,7 @@ function Save-OnlinePackages {
     $cookie = Get-Fe3Cookie
 
     $offered = @{}
+    $lookupFailed = @{}
     foreach ($fam in $Families) {
         try {
             $cat = Get-WuCategoryId -PackageFamilyName $fam
@@ -628,6 +804,7 @@ function Save-OnlinePackages {
         }
         catch {
             if ($fam -eq $script:StoreFamily) { throw }
+            $lookupFailed[$fam] = $true
             Write-Log "Online lookup failed for ${fam}: $($_.Exception.Message)" 'WARN'
         }
     }
@@ -658,6 +835,11 @@ function Save-OnlinePackages {
     if (-not ($selected | Where-Object { $_.Identity.Family -eq $script:StoreFamily })) {
         throw 'The Store service did not offer a usable Microsoft.WindowsStore package'
     }
+    $missing = @($Families | Where-Object { $family = $_; $lookupFailed.ContainsKey($family) -or -not ($selected | Where-Object { $_.Identity.Family -eq $family }) })
+    foreach ($family in $missing) {
+        $script:FailCount++
+        Write-Log "Requested app unavailable: $family. This run is incomplete." 'WARN'
+    }
 
     $totalMb = [math]::Round(($selected | Measure-Object -Property Size -Sum).Sum / 1MB, 1)
     Write-Log "Selected $($selected.Count) package(s), $totalMb MB, download folder: $Destination"
@@ -666,7 +848,11 @@ function Save-OnlinePackages {
         $null = New-Item -ItemType Directory -Path $Destination -Force
     }
 
-    foreach ($p in $selected) {
+    # Remove stale metadata first so an interrupted replacement cannot look complete.
+    $manifestPath = Join-Path $Destination 'store-packages.json'
+    if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force }
+    $downloaded = @(foreach ($p in $selected) {
+        if (($p.Moniker + $p.Extension) -match '[\\/:*?"<>|]' -or $p.Moniker -match '^\.') { throw 'Service returned an unsafe package filename' }
         $target = Join-Path $Destination ($p.Moniker + $p.Extension)
         if ((Test-Path -LiteralPath $target -PathType Leaf) -and -not (Test-PackageFile -Path $target -Package $p)) {
             Write-Log "Already downloaded (verified): $([IO.Path]::GetFileName($target))"
@@ -674,28 +860,43 @@ function Save-OnlinePackages {
             continue
         }
 
-        $part = "$target.part"
+        $part = Join-Path $Destination (([guid]::NewGuid().ToString('N')) + '.part' + $p.Extension)
+        try {
         $null = Invoke-WithRetry -What "Download of $($p.Moniker)" -Action {
             # URLs are short-lived; request a fresh one per attempt.
             $url = Get-Fe3FileUrl -Package $p -DeviceAttributes $attrs
             Write-Log ('Downloading {0} ({1:N1} MB)' -f [IO.Path]::GetFileName($target), ($p.Size / 1MB))
-            $wc = New-Object Net.WebClient
-            try { $wc.DownloadFile($url, $part) } finally { $wc.Dispose() }
+            Save-PackageDownload -Url $url -Path $part -TimeoutSeconds $DownloadTimeoutSeconds
             $problem = Test-PackageFile -Path $part -Package $p -SkipSignature
             if ($problem) {
                 Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
                 throw "verification failed: $problem"
             }
-            Move-Item -LiteralPath $part -Destination $target -Force
-            $problem = Test-PackageFile -Path $target -Package $p
+            $problem = Test-PackageFile -Path $part -Package $p
             if ($problem) {
-                Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
                 throw "verification failed: $problem"
             }
+            Move-Item -LiteralPath $part -Destination $target -Force
         }
+        } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
         Write-Log "Downloaded + verified (hash, Microsoft signature): $([IO.Path]::GetFileName($target))"
         Get-Item -LiteralPath $target
+    })
+    $manifest = [ordered]@{
+        SchemaVersion = 1
+        CreatedUtc = [DateTime]::UtcNow.ToString('o')
+        OsArch = $OsArch
+        Build = $Build
+        RequestedFamilies = @($Families)
+        MissingFamilies = @($missing)
+        Files = @($downloaded | ForEach-Object { [ordered]@{ Name = $_.Name; Size = $_.Length; Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } })
     }
+    $manifestPart = "$manifestPath.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPart -Encoding UTF8
+        Move-Item -LiteralPath $manifestPart -Destination $manifestPath -Force
+    } finally { Remove-Item -LiteralPath $manifestPart -Force -ErrorAction SilentlyContinue }
+    $downloaded
 }
 # endregion
 
@@ -728,7 +929,10 @@ try {
         return (Invoke-Relaunch)
     }
 
-    $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+    $osVersionInfo = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $build = [int]$osVersionInfo.CurrentBuildNumber
+    $revision = 0
+    if ($osVersionInfo.PSObject.Properties['UBR']) { $revision = [int]$osVersionInfo.UBR }
     if (-not $DownloadOnly -and $build -lt 19041) {
         Write-Host 'ERROR: Requires Windows build 19041 or later.'
         return 2
@@ -753,7 +957,7 @@ try {
 
     # Log dir: requested/default location, falling back to %TEMP% (e.g. packages on read-only media)
     $tempLogDir = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs'
-    $logName = 'StoreInstall-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date)
+    $logName = 'StoreInstall-{0:yyyyMMdd-HHmmss}-{1}.log' -f (Get-Date), ([guid]::NewGuid().ToString('N'))
     $logCandidates = @(
         $(if ($LogDir) { [IO.Path]::GetFullPath($LogDir) } elseif ($WorkDir) { Join-Path $WorkDir 'Logs' } else { $tempLogDir }),
         $tempLogDir
@@ -780,7 +984,16 @@ try {
                 Where-Object { $extensions -contains $_.Extension.ToLowerInvariant() } |
                 Sort-Object Name
         })
-    $hasLocalStore = [bool]($localPkgs | Where-Object { (Get-PackageIdentity -FileName $_.Name).Name -eq 'Microsoft.WindowsStore' })
+    $hasLocalStore = $false
+    if ($Source -eq 'Auto' -and -not $DownloadOnly) {
+        foreach ($localPackage in $localPkgs) {
+            try {
+                $localIdentity = Get-PackageMetadata -Path $localPackage.FullName -OsArch $osArch -Build $build -Revision $revision
+                if ($localIdentity.Supported -and $localIdentity.Name -eq 'Microsoft.WindowsStore' -and (Get-ArchRank -Arch $localIdentity.Arch -OsArch $osArch -Build $build) -gt 0) { $hasLocalStore = $true; break }
+            }
+            catch { Write-Log "Cannot inspect local candidate '$($localPackage.Name)': $($_.Exception.Message)" 'WARN' }
+        }
+    }
     $online = $DownloadOnly -or $Source -eq 'Online' -or ($Source -eq 'Auto' -and -not $hasLocalStore)
 
     Write-Log '==== Microsoft Store unattended install starting ===='
@@ -796,17 +1009,23 @@ try {
 
     $script:LicenseDirs = @($WorkDir | Where-Object { $_ })
 
+    $families = @($script:StoreFamily) + $script:OptionalFamilies
+    if (-not $SkipWinget) { $families += $script:WingetFamily }
+
     if ($online) {
         if ($DownloadDir) {
             $pkgDir = [IO.Path]::GetFullPath($DownloadDir)
         }
         else {
-            $pkgDir = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Packages'
-            if (-not $KeepDownloads -and -not $DownloadOnly) { $script:CleanupDir = $pkgDir }
+            $runToken = [guid]::NewGuid().ToString('N')
+            $pkgDir = Join-Path ([IO.Path]::GetTempPath()) ('StoreInstall-Packages-' + $runToken)
+            $null = New-Item -ItemType Directory -Path $pkgDir
+            Set-Content -LiteralPath (Join-Path $pkgDir '.store-ltsc-owner') -Value $runToken -Encoding ASCII
+            if (-not $KeepDownloads -and -not $DownloadOnly) {
+                $script:CleanupDir = $pkgDir
+                $script:CleanupToken = $runToken
+            }
         }
-
-        $families = @($script:StoreFamily) + $script:OptionalFamilies
-        if (-not $SkipWinget) { $families += $script:WingetFamily }
 
         Write-Log '---- Downloading packages from Microsoft ----'
         try {
@@ -821,6 +1040,7 @@ try {
         if ($DownloadOnly) {
             Write-Log "Downloaded $($all.Count) package(s) to $pkgDir"
             Write-Log "Install later with: -Source Local -WorkDir `"$pkgDir`""
+            if ($script:FailCount -gt 0) { return (Complete-Run 5 'download set incomplete') }
             return (Complete-Run 0 'download only')
         }
     }
@@ -830,7 +1050,12 @@ try {
             Write-Log 'No WorkDir for local packages (use -WorkDir).' 'ERROR'
             return (Complete-Run 4)
         }
-        Get-ChildItem -LiteralPath $WorkDir -File | Unblock-File -ErrorAction SilentlyContinue -ErrorVariable unblockErr
+        if (Test-Path -LiteralPath (Join-Path $WorkDir 'store-packages.json') -PathType Leaf) {
+            $all = @(Test-OfflineManifest -Directory $WorkDir -OsArch $osArch -Build $build -Families $families)
+        }
+        # Only unblock packages selected for this installation, not unrelated files in WorkDir.
+        $unblockErr = @()
+        $all | Unblock-File -ErrorAction SilentlyContinue -ErrorVariable unblockErr
         if ($unblockErr.Count -gt 0) {
             foreach ($e in $unblockErr) { Write-Log "Unblock-File warning: $($e.Exception.Message)" 'WARN' }
         }
@@ -853,13 +1078,16 @@ try {
     $winget = $null
 
     foreach ($f in $all) {
-        $id = Get-PackageIdentity -FileName $f.Name
-        $pkg = [pscustomobject]@{ File = $f; Identity = $id }
+        try { $id = Get-PackageMetadata -Path $f.FullName -OsArch $osArch -Build $build -Revision $revision }
+        catch { Write-Log "Cannot read package '$($f.Name)': $($_.Exception.Message)" 'ERROR'; return (Complete-Run 4) }
+        if (-not $id.Supported) { Write-Log "Skipping package requiring a newer Windows version: $($f.Name)" 'WARN'; continue }
+        $rank = Get-ArchRank -Arch $id.Arch -OsArch $osArch -Build $build
+        if ($rank -eq 0) { Write-Log "Skipping package (arch '$($id.Arch)' not usable on $osArch build $build): $($f.Name)"; continue }
+        $pkg = [pscustomobject]@{ File = $f; Identity = $id; Rank = $rank }
 
-        if (Test-IsFrameworkPackage -Name $id.Name) {
+        if ($id.IsFramework -or (Test-IsFrameworkPackage -Name $id.Name)) {
             $rank = Get-ArchRank -Arch $id.Arch -OsArch $osArch -Build $build
             if ($rank -gt 0) {
-                $pkg | Add-Member -NotePropertyName Rank -NotePropertyValue $rank
                 $frameworks.Add($pkg)
             }
             else {
@@ -882,6 +1110,19 @@ try {
         return (Complete-Run 4)
     }
 
+    if (-not $online) {
+        foreach ($component in @(
+            @{ Name = 'Store Purchase App'; Package = $purchase; Skip = $false },
+            @{ Name = 'Xbox Identity Provider'; Package = $xboxId; Skip = $false },
+            @{ Name = 'App Installer'; Package = $winget; Skip = [bool]$SkipWinget }
+        )) {
+            if (-not $component.Package -and -not $component.Skip) {
+                $script:FailCount++
+                Write-Log "Requested app missing from local packages: $($component.Name). This run is incomplete." 'WARN'
+            }
+        }
+    }
+
     Write-Log "Store               : $($store.File.Name)"
     Write-Log ('PurchaseApp         : {0}' -f $(if ($purchase) { $purchase.File.Name } else { '(not present)' }))
     Write-Log ('XboxIdentityProvider: {0}' -f $(if ($xboxId) { $xboxId.File.Name } else { '(not present)' }))
@@ -893,11 +1134,17 @@ try {
         Write-Log ('DesktopAppInstaller : {0}' -f $(if ($winget) { $winget.File.Name } else { '(not present)' }))
     }
 
-    $sortedFw = @($frameworks | Sort-Object -Property @(
-        @{ Expression = { Get-FrameworkSortKey -Name $_.Identity.Name } },
-        @{ Expression = { $_.Rank }; Descending = $true },
-        @{ Expression = { $_.File.Name } }
-    ))
+    # Keep the newest package per identity and architecture before dependency validation.
+    $uniqueFw = @{}
+    foreach ($fw in $frameworks) {
+        $key = '{0}|{1}|{2}' -f $fw.Identity.Name, $fw.Identity.Publisher, $fw.Identity.Arch
+        $uniqueFw[$key] = Select-NewerPackage $uniqueFw[$key] $fw
+    }
+    try {
+        $apps = @(@($store, $purchase, $xboxId, $winget) | Where-Object { $null -ne $_ })
+        $sortedFw = @(Get-DependencyInstallOrder -Frameworks @($uniqueFw.Values) -Applications @($apps + @($other.ToArray())))
+    }
+    catch { Write-Log $_.Exception.Message 'ERROR'; return (Complete-Run 4) }
 
     Write-Log '---- Installing framework dependencies ----'
     foreach ($fw in $sortedFw) {
@@ -954,9 +1201,38 @@ if ($PauseAtEnd) {
     Write-Host ''
     $null = Read-Host "Finished with exit code $StoreLtscExitCode. Press Enter to close"
 }
-if ($PSCommandPath) { exit $StoreLtscExitCode }
+if ($OriginalScriptPath) { exit $StoreLtscExitCode }
 
-# irm | iex: never `exit` (it would close the user's window); report via $LASTEXITCODE and tidy up.
+# irm | iex: report the result without closing the caller's PowerShell window.
 $global:LASTEXITCODE = $StoreLtscExitCode
-Remove-Variable -Name StoreLtscInvocation, StoreLtscExitCode, WorkDir, LogDir, Source, DownloadDir, DownloadOnly,
-    KeepDownloads, NoProvision, SkipWinget, PauseAtEnd, kv -ErrorAction SilentlyContinue
+}
+
+# An outer param block would bind variables in the caller's scope under Invoke-Expression.
+# Convert supported named arguments to a splat inside this private child scope instead.
+$forward = @{}
+$stringParameters = @('WorkDir', 'LogDir', 'Source', 'DownloadDir', 'DownloadTimeoutSeconds', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable')
+$switchParameters = @('DownloadOnly', 'KeepDownloads', 'NoProvision', 'SkipWinget', 'PauseAtEnd', 'Verbose', 'Debug')
+for ($index = 0; $index -lt $InvocationArguments.Count; $index++) {
+    $argument = [string]$InvocationArguments[$index]
+    if ($argument -notmatch '^-(?<Name>[a-zA-Z]+)(?::(?<Value>.*))?$') { throw "Expected a named parameter, received '$argument'." }
+    $name = $Matches.Name
+    $inlineValue = $Matches.Value
+    if ($stringParameters -contains $name) {
+        if ($argument.Contains(':') -and $inlineValue -ne '') { $forward[$name] = $inlineValue }
+        else {
+            if (++$index -ge $InvocationArguments.Count) { throw "Missing value for -$name." }
+            $forward[$name] = $InvocationArguments[$index]
+        }
+    }
+    elseif ($switchParameters -contains $name) {
+        if (-not $argument.Contains(':')) { $forward[$name] = $true }
+        elseif ($inlineValue -eq '' -and ($index + 1) -lt $InvocationArguments.Count -and $InvocationArguments[$index + 1] -is [bool]) {
+            $forward[$name] = $InvocationArguments[++$index]
+        }
+        elseif ($inlineValue -match '^\$?(true|false)$') { $forward[$name] = $Matches[1] -eq 'true' }
+        else { throw "Invalid switch value for -$name." }
+    }
+    else { throw "Unknown parameter -$name." }
+}
+Invoke-StoreLtsc @forward
+} $args $PSCommandPath
