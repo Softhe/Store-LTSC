@@ -218,7 +218,7 @@ function Invoke-Relaunch {
             return $proc.ExitCode
         }
         Write-Host "Re-launching in 64-bit Windows PowerShell: $psExe"
-        & $psExe @argList
+        & $psExe @argList | Out-Host   # show the child's output instead of returning it as pipeline data
         return $LASTEXITCODE
     }
     finally {
