@@ -52,8 +52,9 @@ if %_build% lss 19041 (
 
 rem Packages: local ones next to this script if present (-Source Auto), otherwise downloaded from Microsoft.
 rem Options (-Source, -WorkDir, -DownloadDir, -DownloadOnly, -NoProvision, -SkipWinget, ...) pass through.
+rem Match -Source only as a whole option (" -Source " or " -Source:"), not inside a path such as D:\my-source.
 set "_src=-Source Auto"
-echo( %_args% | findstr /i /c:"-Source" 1>nul && set "_src="
+echo( %_args% _| findstr /i /r /c:" -Source[ :]" 1>nul && set "_src="
 "%_psexe%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%_ps1%" %_src% %_args%
 set "_rc=%ERRORLEVEL%"
 if defined _pause (

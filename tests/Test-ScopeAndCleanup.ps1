@@ -63,13 +63,23 @@ function Start-Process {
     Assert-True ((Get-Content -LiteralPath $snapshotPath -Raw) -ceq $installerText) 'Relaunch changed the executing revision.'
     Assert-True ($bootstrap -match "FromBase64String\('([^']+)'\)") 'Missing serialized parameters.'
     $parameters = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])))
-    Assert-True ($parameters.WorkDir -eq 'C:\offline packages') 'Relaunch lost a path containing spaces.'
+    $script:CapturedParameters = $parameters
     $script:CapturedSnapshot = $snapshotPath
     [pscustomobject]@{ ExitCode = 5 }
 }
 $result = Invoke-Relaunch -Elevate
 Assert-True ($result -eq 5) 'Relaunch lost the child exit code.'
+Assert-True ($script:CapturedParameters.WorkDir -eq 'C:\offline packages') 'Relaunch lost a path containing spaces.'
 Assert-True (-not (Test-Path -LiteralPath $script:CapturedSnapshot)) 'Relaunch snapshot was not cleaned up.'
+
+# The elevated child starts in System32, so it must receive the already-resolved paths, not the typed relative ones.
+$script:BoundParams = @{ Source = 'Local'; WorkDir = '.\pkgs'; LogDir = 'logs'; DownloadDir = 'downloads' }
+$WorkDir = 'C:\resolved\pkgs'; $LogDir = 'C:\resolved\logs'; $DownloadDir = 'C:\resolved\downloads'
+$null = Invoke-Relaunch -Elevate
+Assert-True ($script:CapturedParameters.WorkDir -eq 'C:\resolved\pkgs' -and $script:CapturedParameters.LogDir -eq 'C:\resolved\logs' -and $script:CapturedParameters.DownloadDir -eq 'C:\resolved\downloads') 'Relaunch forwarded unresolved relative paths.'
+$script:BoundParams = @{ Source = 'Local' }
+$null = Invoke-Relaunch -Elevate
+Assert-True ($script:CapturedParameters.WorkDir -eq 'C:\resolved\pkgs' -and -not $script:CapturedParameters.ContainsKey('DownloadDir')) 'Relaunch must forward the resolved WorkDir without inventing unbound options.'
 
 # Exercise the native process boundary too. The invalid combination exits before any
 # OS, admin, network, log, or package operation in the real Windows PowerShell child.

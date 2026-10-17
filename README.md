@@ -81,7 +81,7 @@ In online mode, the script looks up the apps in Microsoft's Store catalog and re
 
 For each download, the script checks the file size and the hash supplied by Microsoft over HTTPS. It uses SHA-256 when available and falls back to SHA-1. It also requires a valid Microsoft Corporation code signature before replacing the destination file. Failed attempts remove their temporary files, and the script retries before reporting a failure.
 
-For local packages, the script reads identities and dependencies from package manifests. It filters unsupported architectures and Windows versions before selecting apps. Missing dependencies and framework dependency cycles stop the run before installation.
+For local packages, the script reads identities and dependencies from package manifests. It filters unsupported architectures and Windows versions before selecting apps. Missing Microsoft Store dependencies and framework dependency cycles stop the run before installation. A companion app with missing dependencies is skipped and reported as a partial failure.
 
 The script installs frameworks in dependency order, followed by Microsoft Store and the companion apps. By default, it provisions packages in the Windows image and registers them for the current user. `-NoProvision` skips provisioning. Missing requested companion apps produce a partial-failure result, including in download-only mode.
 
