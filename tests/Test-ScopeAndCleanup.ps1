@@ -31,7 +31,7 @@ $safeSource = $installerText.Remove($moduleCommand.Extent.StartOffset, $moduleCo
 }
 
 # Load the actual functions without running the installer.
-foreach ($name in @('Complete-Run', 'Invoke-Relaunch')) {
+foreach ($name in @('Complete-Run', 'Invoke-Relaunch', 'Clear-Progress')) {
     $definition = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object Name -eq $name | Select-Object -First 1
     Invoke-Expression $definition.Extent.Text
 }

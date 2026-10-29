@@ -130,6 +130,7 @@ $script:ScriptPath = $Invocation.ScriptPath
 $script:ScriptText = $Invocation.ScriptText
 
 $script:LogFile = $null
+$script:ActiveProgress = $null
 $script:FailCount = 0
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:SupersededFrameworks = New-Object System.Collections.Generic.List[string]
@@ -184,12 +185,14 @@ function Write-Log {
     )
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = '[{0}] [{1}] {2}' -f $ts, $Level, $Message
+    $saved = $false
     if ($script:LogFile) {
-        try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 }
+        try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8; $saved = $true }
         catch { Write-Host "[log write failed: $($_.Exception.Message)]" -ForegroundColor Yellow }
     }
-    if ($Quiet) { return }
-    $text = if ($Console) { $Console } else { $Message }
+    # Without a log file, details would be lost: show the full message instead of hiding or shortening it.
+    if ($Quiet -and $saved) { return }
+    $text = if ($Console -and $saved) { $Console } else { $Message }
     $status = switch ($Level) { 'WARN' { 'WARN' } 'ERROR' { 'FAIL' } default { '' } }
     Write-StatusLine $status $text
 }
@@ -217,8 +220,15 @@ function Show-Progress {
     # A transient progress bar for long steps. The module silences progress from Appx cmdlets, so enable it locally.
     param([Parameter(Mandatory)][string] $Activity, [string] $Status = ' ', [int] $Percent = -1, [switch] $Completed)
     $ProgressPreference = 'Continue'
-    if ($Completed) { Write-Progress -Activity $Activity -Completed }
-    else { Write-Progress -Activity $Activity -Status $Status -PercentComplete $Percent }
+    if ($null -eq $script:ActiveProgress) { $script:ActiveProgress = New-Object 'System.Collections.Generic.HashSet[string]' }
+    if ($Completed) { Write-Progress -Activity $Activity -Completed; $null = $script:ActiveProgress.Remove($Activity) }
+    else { Write-Progress -Activity $Activity -Status $Status -PercentComplete $Percent; $null = $script:ActiveProgress.Add($Activity) }
+}
+
+function Clear-Progress {
+    # Closes progress bars left open when a step stops with an error.
+    if ($null -eq $script:ActiveProgress) { return }
+    foreach ($activity in @($script:ActiveProgress)) { Show-Progress -Activity $activity -Completed }
 }
 
 function Format-PackageLabel {
@@ -253,6 +263,7 @@ function Format-ErrorText {
 function Complete-Run {
     # Cleanup, final log line and console result; returns the exit code (use as: return (Complete-Run 5 'reason')).
     param([Parameter(Mandatory)][int] $Code, [string] $Reason, [string] $Hint)
+    Clear-Progress
     if (-not $Reason) {
         $Reason = switch ($Code) {
             0 { 'Finished' }
@@ -1375,6 +1386,7 @@ try {
             $all = @(Save-OnlinePackages -Destination $pkgDir -Families $families -OsArch $osArch -Build $build)
         }
         catch {
+            Clear-Progress
             Write-Log "Download FAILED: $($_.Exception.Message)" 'ERROR'
             Write-Log 'Check internet access to displaycatalog.mp.microsoft.com, fe3.delivery.mp.microsoft.com and *.dl.delivery.mp.microsoft.com (proxy/firewall).' 'ERROR'
             return (Complete-Run 8 'Download failed')
@@ -1544,6 +1556,7 @@ try {
     return (Complete-Run 0 'Microsoft Store is installed' $hint)
 }
 catch {
+    Clear-Progress
     Write-Log "FATAL: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))" 'ERROR'
     return (Complete-Run 7)
 }
