@@ -77,13 +77,17 @@ If you have license XML files, put them beside the packages and name them `<Pack
 
 ## What the script does
 
-In online mode, the script looks up the apps in Microsoft's Store catalog and requests package metadata from the Store delivery service. It selects app packages by the service's package rank, then version and architecture. It selects the newest offered framework version for each usable architecture, including x86 frameworks on x64 and ARM64 systems.
+In online mode, the script looks up the apps in Microsoft's Store catalog and requests package metadata from the Store delivery service. It selects app packages by the service's package rank, then version and architecture. It downloads the selected apps first, reads the dependencies declared in their manifests, and downloads only those frameworks, using the newest offered version for each architecture. Frameworks for older app versions or unused architectures are not downloaded. Local folders follow the same rule: frameworks that no app declares are skipped. Apps you later install from Microsoft Store bring their own dependencies.
 
 For each download, the script checks the file size and the hash supplied by Microsoft over HTTPS. It uses SHA-256 when available and falls back to SHA-1. It also requires a valid Microsoft Corporation code signature before replacing the destination file. Failed attempts remove their temporary files, and the script retries before reporting a failure.
 
 For local packages, the script reads identities and dependencies from package manifests. It filters unsupported architectures and Windows versions before selecting apps. Missing Microsoft Store dependencies and framework dependency cycles stop the run before installation. A companion app with missing dependencies is skipped and reported as a partial failure.
 
 The script installs frameworks in dependency order, followed by Microsoft Store and the companion apps. By default, it provisions packages in the Windows image and registers them for the current user. `-NoProvision` skips provisioning. Missing requested companion apps produce a partial-failure result, including in download-only mode.
+
+Windows cannot deploy an older copy of a framework that is already present. When the same framework is already provisioned or registered at the same or a newer version, the script skips that step. If provisioning rejects an older framework because a newer one is installed, the script logs a warning and defers the decision to verification.
+
+After installation, the script asks Windows for the result. It confirms that each installed app is registered for the current user with status `Ok`. When provisioning, it also confirms that each app is provisioned and that every dependency is provisioned at the required version for new users. Anything not confirmed is a partial failure, and the log summary lists every failure by name.
 
 When run as SYSTEM, such as through Intune, SCCM, or MDT, the script only provisions packages. Windows registers them for users at sign-in. Do not combine SYSTEM execution with `-NoProvision`.
 
@@ -110,8 +114,8 @@ For download failures, check access to the Microsoft domains listed in the requi
 | 2 | Windows build is below 19041. |
 | 3 | PowerShell is not in FullLanguage mode. |
 | 4 | A required package or dependency is missing, incompatible, or invalid. |
-| 5 | A requested app is unavailable, or an installation or provisioning step failed after the Store step succeeded. Download-only sets can also be incomplete. |
-| 6 | The Store installation or provisioning step failed. |
+| 5 | A requested app is unavailable, an installation or provisioning step failed after the Store step succeeded, or verification could not confirm a companion app or a new-user dependency. Download-only sets can also be incomplete. |
+| 6 | The Store installation or provisioning step failed, or the Store is not registered for the current user afterwards. |
 | 7 | A fatal error or invalid configuration stopped the run. |
 | 8 | Package lookup, download, or verification failed. |
 
