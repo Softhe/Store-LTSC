@@ -30,9 +30,23 @@ Frameworks install in dependency order. Before deployment, the script checks req
 
 Relative `-WorkDir`, `-LogDir`, and `-DownloadDir` paths resolve against the current PowerShell location before any relaunch. `-Source Local` without `-WorkDir` uses the current PowerShell location. The elevated or 64-bit child receives the resolved paths.
 
+## Framework selection
+
+The Store service offers frameworks for every version of each app. The same LTSC 2024 run downloaded and installed 22 frameworks, including `Microsoft.UI.Xaml.2.4` and `Microsoft.NET.Native` 1.3 and 1.7, without checking whether the selected apps used them.
+
+Online mode now downloads the selected apps first and reads the dependencies in their manifests. For bundles, it reads the payload for the best architecture on this machine. It then downloads only the offered frameworks that match a declared name, publisher, architecture, and minimum version, and repeats for those frameworks' own dependencies. Before installation, local and offline folders follow the same rule: frameworks that no app declares are skipped and logged. Download-only manifests list only the files that were downloaded.
+
+## Newer frameworks and post-install verification
+
+The Store service can offer a framework older than one already on the system. On a 2026-10-29 LTSC 2024 test (build 26100.9457), it offered `Microsoft.UI.Xaml.2.8` 8.2501.31001.0 while 8.2511.26001.0 was installed. Provisioning failed with `Element not found`, and current-user registration returned `0x80073D06`. Store and its companions still worked, but the run exited with code 5.
+
+The installer now checks for the same framework name, publisher, and architecture at the same or a newer version. If one is provisioned, it skips provisioning. If one is registered for the current user, it skips registration. If provisioning fails while a newer copy is installed for any user, the installer records a warning instead of a failure.
+
+Verification then decides the result. It checks current-user registration status for each installed app. When provisioning, it checks that every app, each manifest dependency, and the dependencies of installed frameworks are provisioned at the required version and architecture. A framework copy registered for the current user is reused only when its status is `Ok`. A dependency that new users would lack is a partial failure. A Store that is not registered after installation is a Store failure. The summary lists each failure by name.
+
 ## Exit codes
 
-Existing exit codes remain in use. Code 4 also covers invalid or incompatible package metadata and missing dependencies. Code 5 means a requested app or deployment step failed, including an incomplete download-only set. Code 7 covers invalid offline manifests and other fatal errors. Code 8 covers online lookup, transfer, and verification failures for required downloads.
+Existing exit codes remain in use. Code 4 also covers invalid or incompatible package metadata and missing dependencies. Code 5 means a requested app or deployment step failed, or verification could not confirm a companion app or a new-user dependency. It also covers an incomplete download-only set. Code 6 also covers a Store that is not registered after installation. Code 7 covers invalid offline manifests and other fatal errors. Code 8 covers online lookup, transfer, and verification failures for required downloads.
 
 ## Validation
 
@@ -43,6 +57,6 @@ powershell.exe -NoProfile -NonInteractive -File .\tests\Run-Tests.ps1
 pwsh.exe -NoProfile -NonInteractive -File .\tests\Run-Tests.ps1
 ```
 
-The tests use the installer's actual functions and main orchestration with fixture packages and mocked deployment calls. They cover caller scope, relaunch snapshots and arguments, relative path resolution, the command launcher's `-Source` default, cleanup ownership, package selection, dependencies, offline manifests, incomplete requested sets, and cancellation of a stalled loopback HTTP transfer. GitHub Actions runs the suite under both PowerShell engines.
+The tests use the installer's actual functions and main orchestration with fixture packages and mocked deployment calls. They cover caller scope, relaunch snapshots and arguments, relative path resolution, the command launcher's `-Source` default, cleanup ownership, package selection, dependencies, superseded frameworks, post-install verification, offline manifests, incomplete requested sets, and cancellation of a stalled loopback HTTP transfer. GitHub Actions runs the suite under both PowerShell engines.
 
 These tests do not install packages or exercise UAC. They do not prove that Microsoft's live delivery service offers an installable package set for a particular LTSC image. Before release, test online and offline installation on disposable LTSC 2021 and LTSC 2024 systems, including SYSTEM provisioning and a new user's first sign-in. Check that Microsoft Store opens, winget runs, and the expected packages register for the intended users.

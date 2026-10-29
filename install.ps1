@@ -18,7 +18,7 @@
   - Non-interactive, CI/MDT/SSH friendly (also runs as SYSTEM: provisions only)
   - Logging with timestamps
   - Dynamic license discovery (PackageFamilyName.xml) or -SkipLicense
-  - Arch-aware framework selection (x86 side-by-side + native)
+  - Installs only the frameworks the apps declare (newest offered version per architecture)
   - Installs Store, StorePurchaseApp, XboxIdentityProvider, DesktopAppInstaller
   - Re-launches itself elevated (interactive sessions) and in 64-bit Windows PowerShell
     when started from 32-bit PowerShell or PowerShell 7
@@ -75,7 +75,7 @@
   Tips:
     1. Needs admin rights; packages are downloaded from Microsoft (or taken from -WorkDir).
     2. License XMLs are optional; matched dynamically when present.
-    3. Keep current VCLibs / UI.Xaml / NET.Native / WindowsAppRuntime for your arch.
+    3. Only frameworks the apps declare in their manifests are downloaded and installed.
     4. Failures are written to the log (nothing important is swallowed).
     5. Reboot after clean LTSC/IoT restores before relying on Store/winget.
 #>
@@ -131,6 +131,10 @@ $script:ScriptText = $Invocation.ScriptText
 
 $script:LogFile = $null
 $script:FailCount = 0
+$script:Failures = New-Object System.Collections.Generic.List[string]
+$script:SupersededFrameworks = New-Object System.Collections.Generic.List[string]
+$script:ProvisionedCache = $null
+$script:IsOnline = $false
 $script:LicenseDirs = @()
 $script:CleanupDir = $null
 $script:CleanupToken = $null
@@ -164,6 +168,19 @@ function Write-Log {
         catch { Write-Host "[log write failed: $($_.Exception.Message)]" }
     }
     Write-Host $line
+}
+
+function Add-Failure {
+    # Counts a partial failure and keeps its description for the summary.
+    param([Parameter(Mandatory)][string] $Message)
+    $script:FailCount++
+    $script:Failures.Add($Message)
+}
+
+function Format-ErrorText {
+    # Deployment errors span several lines; keep each log entry on one line.
+    param([AllowNull()][AllowEmptyString()][string] $Text)
+    return ($Text -replace '\s+', ' ').Trim()
 }
 
 function Complete-Run {
@@ -417,8 +434,83 @@ function Test-OptionalAppDependency {
     $missing = @((Get-PackageDependencyState -Package $Package -Frameworks $Frameworks).Missing)
     if ($missing.Count -eq 0) { return $true }
     foreach ($dep in $missing) { Write-Log "Skipping $($Package.File.Name): $(Format-MissingDependency $dep $Package)" 'WARN' }
-    $script:FailCount++
+    Add-Failure "Skipped $($Package.Identity.Name): missing dependencies"
     return $false
+}
+
+function Get-ProvisionedIdentity {
+    # Provisioned package identities, read once; -Refresh re-reads the image after provisioning changes.
+    param([switch] $Refresh)
+    if ($Refresh -or $null -eq $script:ProvisionedCache) {
+        $script:ProvisionedCache = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | ForEach-Object { Get-PackageIdentity -FileName ($_.PackageName + '.appx') })
+    }
+    return $script:ProvisionedCache
+}
+
+function Find-InstalledFramework {
+    # Packages with the same framework identity (name, publisher, architecture) at version >= the given package.
+    param(
+        [Parameter(Mandatory)] $Identity,
+        [Parameter(Mandatory)][ValidateSet('Provisioned', 'CurrentUser', 'AllUsers')][string] $Scope
+    )
+    if ($Scope -eq 'Provisioned') {
+        return @(Get-ProvisionedIdentity | Where-Object { $_.Name -eq $Identity.Name -and $_.Family -eq $Identity.Family -and $_.Arch -eq $Identity.Arch -and $_.Version -ge $Identity.Version } |
+            Sort-Object Version -Descending)
+    }
+    $packages = if ($Scope -eq 'AllUsers') { Get-AppxPackage -AllUsers -Name $Identity.Name -ErrorAction SilentlyContinue } else { Get-AppxPackage -Name $Identity.Name -ErrorAction SilentlyContinue }
+    # A current-user copy that needs repair must not suppress re-registration.
+    return @($packages | Where-Object { $_.Publisher -eq $Identity.Publisher -and $_.Architecture.ToString() -eq $Identity.Arch -and [version]$_.Version -ge $Identity.Version -and ($Scope -ne 'CurrentUser' -or [string]$_.Status -eq 'Ok') } |
+        Sort-Object { [version]$_.Version } -Descending)
+}
+
+function Test-InstallResult {
+    # Confirms the result with Windows instead of trusting cmdlet success: current-user registration and, when
+    # provisioning, that every app and each dependency of the apps and installed frameworks is provisioned for new users.
+    # Returns $false if the Store is not registered.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Applications, [object[]] $Frameworks = @())
+    $storeRegistered = $true
+    if (-not $script:IsSystem) {
+        foreach ($app in $Applications) {
+            $registered = @(Get-AppxPackage -Name $app.Identity.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.Status -eq 'Ok' })
+            if ($registered.Count -gt 0) {
+                Write-Log "Verified (current user): $($app.Identity.Name) $($registered[0].Version), status Ok"
+                continue
+            }
+            Write-Log "Not registered for the current user after installation: $($app.Identity.Name)" 'ERROR'
+            Add-Failure "$($app.Identity.Name) is not registered for the current user"
+            if ($app.Identity.Name -eq 'Microsoft.WindowsStore') { $storeRegistered = $false }
+        }
+    }
+    if (-not $script:DoProvision) { return $storeRegistered }
+
+    $provisioned = @(Get-ProvisionedIdentity -Refresh)
+    $problems = 0
+    $appNames = @($Applications | ForEach-Object { $_.Identity.Name })
+    # Frameworks' own dependencies count too: an app can rely on them through a framework.
+    foreach ($pkg in @($Applications) + @($Frameworks)) {
+        $isApp = $appNames -contains $pkg.Identity.Name
+        if ($isApp -and -not ($provisioned | Where-Object { $_.Name -eq $pkg.Identity.Name -and $_.Family -eq $pkg.Identity.Family })) {
+            $problems++
+            Write-Log "Not provisioned for new users after installation: $($pkg.Identity.Name)" 'ERROR'
+            Add-Failure "$($pkg.Identity.Name) is not provisioned for new users"
+            continue
+        }
+        foreach ($dep in $pkg.Identity.Dependencies) {
+            $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
+            $match = @($provisioned | Where-Object { $_.Name -eq $dep.Name -and (-not $expectedFamily -or $_.Family -eq $expectedFamily) -and ($_.Arch -eq 'neutral' -or $_.Arch -eq $dep.Arch) -and $_.Version -ge $dep.MinVersion })
+            if ($match.Count -gt 0) { continue }
+            $problems++
+            Write-Log "New users: $($pkg.Identity.Name) needs $($dep.Name) $($dep.MinVersion) or newer ($($dep.Arch)), which is not provisioned." 'ERROR'
+            Add-Failure "$($dep.Name) ($($dep.Arch)) for $($pkg.Identity.Name) is not provisioned for new users"
+        }
+    }
+    if ($problems -eq 0) {
+        Write-Log "Verified (new users): $(@($Applications).Count) app(s) provisioned with all dependencies"
+        foreach ($name in $script:SupersededFrameworks) {
+            Write-Log "Not provisioning ${name} is harmless: newer provisioned frameworks satisfy every app dependency."
+        }
+    }
+    return $storeRegistered
 }
 
 function Get-DependencyInstallOrder {
@@ -439,6 +531,23 @@ function Get-DependencyInstallOrder {
         $ordered.Add($next[0]); $null = $pending.Remove($next[0])
     }
     return $ordered.ToArray()
+}
+
+function Select-RequiredFramework {
+    # Keeps the frameworks the apps declare, directly or through another kept framework.
+    param([object[]] $Frameworks, [object[]] $Applications)
+    $required = New-Object System.Collections.Generic.List[object]
+    $pending = New-Object System.Collections.Generic.Queue[object]
+    foreach ($app in $Applications) { $pending.Enqueue($app) }
+    while ($pending.Count -gt 0) {
+        foreach ($fw in @((Get-PackageDependencyState -Package $pending.Dequeue() -Frameworks $Frameworks).Required)) {
+            if (-not $required.Contains($fw)) { $required.Add($fw); $pending.Enqueue($fw) }
+        }
+    }
+    foreach ($fw in $Frameworks) {
+        if (-not $required.Contains($fw)) { Write-Log "Skipping framework no app declares: $($fw.File.Name)" }
+    }
+    return $required.ToArray()
 }
 
 function Find-License {
@@ -517,7 +626,12 @@ function Install-OnePackage {
     $name = $Package.File.Name
     $ok = $true
 
-    if ($script:DoProvision) {
+    # Windows cannot deploy an older copy of a framework that is already present; skip instead of failing.
+    $provisioned = @(if ($script:DoProvision -and $IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope Provisioned })
+    if ($provisioned.Count -gt 0) {
+        Write-Log "Already provisioned: $name (version $($provisioned[0].Version) present)"
+    }
+    elseif ($script:DoProvision) {
         $license = $null
         if (-not $IsFramework) {
             $license = Find-License -PackagePath $path -Identity $Package.Identity
@@ -525,7 +639,8 @@ function Install-OnePackage {
                 Write-Log "License for ${name}: $([IO.Path]::GetFileName($license))"
             }
             else {
-                Write-Log "No license XML for ${name}; provisioning with -SkipLicense" 'WARN'
+                # Expected for downloaded packages; a local folder may have been meant to include one.
+                Write-Log "No license XML for ${name}; provisioning with -SkipLicense" $(if ($script:IsOnline) { 'INFO' } else { 'WARN' })
             }
         }
 
@@ -537,12 +652,24 @@ function Install-OnePackage {
             else {
                 $null = Add-AppxProvisionedPackage -Online -PackagePath $path -SkipLicense
             }
+            $script:ProvisionedCache = $null
             Write-Log "Provisioned OK: $name"
         }
         catch {
-            Write-Log "Provision FAILED: $name :: $($_.Exception.Message)" 'ERROR'
-            $ok = $false
-            $script:FailCount++
+            $msg = Format-ErrorText $_.Exception.Message
+            # DISM can reject an older framework when a newer one is already installed ("Element not found").
+            # The post-install check decides whether new users still get every dependency.
+            $newer = @(if ($IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope AllUsers })
+            if ($newer.Count -gt 0) {
+                Write-Log "Provision not applied: $name :: $msg" 'WARN'
+                Write-Log "Version $($newer[0].Version) of this framework is already installed on this machine; new-user dependencies are verified after installation." 'WARN'
+                $script:SupersededFrameworks.Add($name)
+            }
+            else {
+                Write-Log "Provision FAILED: $name :: $msg" 'ERROR'
+                $ok = $false
+                Add-Failure "Provisioning failed: $name"
+            }
         }
     }
 
@@ -552,13 +679,19 @@ function Install-OnePackage {
         return $ok
     }
 
+    $registered = @(if ($IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope CurrentUser })
+    if ($registered.Count -gt 0) {
+        Write-Log "Already registered (current user): $name (version $($registered[0].Version) present)"
+        return $ok
+    }
+
     try {
         Write-Log "Installing (current user): $name"
         $null = Add-AppxPackage -Path $path -ForceApplicationShutdown -ForceUpdateFromAnyVersion
         Write-Log "Install OK: $name"
     }
     catch {
-        $msg = $_.Exception.Message
+        $msg = Format-ErrorText $_.Exception.Message
         # Non-fatal: 0x80073D06 = higher version already installed, 0x80073CFB = same identity already installed
         if ($msg -match '0x80073D06|0x80073CFB|higher version|already installed') {
             Write-Log "Install skipped/non-fatal: $name :: $msg" 'WARN'
@@ -566,7 +699,7 @@ function Install-OnePackage {
         else {
             Write-Log "Install FAILED: $name :: $msg" 'ERROR'
             $ok = $false
-            $script:FailCount++
+            Add-Failure "Install failed (current user): $name"
         }
     }
 
@@ -815,6 +948,44 @@ function Test-OfflineManifest {
     $files
 }
 
+function Save-OnlinePackage {
+    # Downloads one selected package, or reuses a verified copy, and returns its file.
+    param(
+        [Parameter(Mandatory)] $Package,
+        [Parameter(Mandatory)][string] $Destination,
+        [Parameter(Mandatory)][string] $DeviceAttributes
+    )
+    $p = $Package
+    if (($p.Moniker + $p.Extension) -match '[\\/:*?"<>|]' -or $p.Moniker -match '^\.') { throw 'Service returned an unsafe package filename' }
+    $target = Join-Path $Destination ($p.Moniker + $p.Extension)
+    if ((Test-Path -LiteralPath $target -PathType Leaf) -and -not (Test-PackageFile -Path $target -Package $p)) {
+        Write-Log "Already downloaded (verified): $([IO.Path]::GetFileName($target))"
+        return (Get-Item -LiteralPath $target)
+    }
+
+    $part = Join-Path $Destination (([guid]::NewGuid().ToString('N')) + '.part' + $p.Extension)
+    try {
+        $null = Invoke-WithRetry -What "Download of $($p.Moniker)" -Action {
+            # URLs are short-lived; request a fresh one per attempt.
+            $url = Get-Fe3FileUrl -Package $p -DeviceAttributes $DeviceAttributes
+            Write-Log ('Downloading {0} ({1:N1} MB)' -f [IO.Path]::GetFileName($target), ($p.Size / 1MB))
+            Save-PackageDownload -Url $url -Path $part -TimeoutSeconds $DownloadTimeoutSeconds
+            $problem = Test-PackageFile -Path $part -Package $p -SkipSignature
+            if ($problem) {
+                Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+                throw "verification failed: $problem"
+            }
+            $problem = Test-PackageFile -Path $part -Package $p
+            if ($problem) {
+                throw "verification failed: $problem"
+            }
+            Move-Item -LiteralPath $part -Destination $target -Force
+        }
+    } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+    Write-Log "Downloaded + verified (hash, Microsoft signature): $([IO.Path]::GetFileName($target))"
+    return (Get-Item -LiteralPath $target)
+}
+
 function Save-OnlinePackages {
     # Resolves, selects and downloads packages for the given families. Returns the downloaded FileInfo objects.
     param(
@@ -871,12 +1042,15 @@ function Save-OnlinePackages {
     }
     $missing = @($Families | Where-Object { $family = $_; $lookupFailed.ContainsKey($family) -or -not ($selected | Where-Object { $_.Identity.Family -eq $family }) })
     foreach ($family in $missing) {
-        $script:FailCount++
+        Add-Failure "Requested app unavailable: $family"
         Write-Log "Requested app unavailable: $family. This run is incomplete." 'WARN'
     }
 
-    $totalMb = [math]::Round(($selected | Measure-Object -Property Size -Sum).Sum / 1MB, 1)
-    Write-Log "Selected $($selected.Count) package(s), $totalMb MB, download folder: $Destination"
+    # The service offers frameworks for every app version. Download apps first, then only the frameworks
+    # their manifests declare (and what those frameworks declare in turn).
+    $appPkgs = @($selected | Where-Object { -not $script:OnlineFrameworkNames.Contains($_.Identity.Name) })
+    $fwPkgs = @($selected | Where-Object { $script:OnlineFrameworkNames.Contains($_.Identity.Name) })
+    Write-Log "Offered: $($appPkgs.Count) app package(s), $($fwPkgs.Count) framework package(s); download folder: $Destination"
     foreach ($p in $selected) { Write-Log ('  {0}{1} ({2:N1} MB)' -f $p.Moniker, $p.Extension, ($p.Size / 1MB)) }
     if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
         $null = New-Item -ItemType Directory -Path $Destination -Force
@@ -885,37 +1059,31 @@ function Save-OnlinePackages {
     # Remove stale metadata first so an interrupted replacement cannot look complete.
     $manifestPath = Join-Path $Destination 'store-packages.json'
     if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force }
-    $downloaded = @(foreach ($p in $selected) {
-        if (($p.Moniker + $p.Extension) -match '[\\/:*?"<>|]' -or $p.Moniker -match '^\.') { throw 'Service returned an unsafe package filename' }
-        $target = Join-Path $Destination ($p.Moniker + $p.Extension)
-        if ((Test-Path -LiteralPath $target -PathType Leaf) -and -not (Test-PackageFile -Path $target -Package $p)) {
-            Write-Log "Already downloaded (verified): $([IO.Path]::GetFileName($target))"
-            Get-Item -LiteralPath $target
-            continue
-        }
-
-        $part = Join-Path $Destination (([guid]::NewGuid().ToString('N')) + '.part' + $p.Extension)
-        try {
-        $null = Invoke-WithRetry -What "Download of $($p.Moniker)" -Action {
-            # URLs are short-lived; request a fresh one per attempt.
-            $url = Get-Fe3FileUrl -Package $p -DeviceAttributes $attrs
-            Write-Log ('Downloading {0} ({1:N1} MB)' -f [IO.Path]::GetFileName($target), ($p.Size / 1MB))
-            Save-PackageDownload -Url $url -Path $part -TimeoutSeconds $DownloadTimeoutSeconds
-            $problem = Test-PackageFile -Path $part -Package $p -SkipSignature
-            if ($problem) {
-                Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-                throw "verification failed: $problem"
+    $downloaded = New-Object System.Collections.Generic.List[object]
+    $pendingManifests = New-Object System.Collections.Generic.Queue[object]
+    foreach ($p in $appPkgs) {
+        $file = Save-OnlinePackage -Package $p -Destination $Destination -DeviceAttributes $attrs
+        $downloaded.Add($file); $pendingManifests.Enqueue($file)
+    }
+    $neededFw = New-Object System.Collections.Generic.List[object]
+    while ($pendingManifests.Count -gt 0) {
+        $file = $pendingManifests.Dequeue()
+        foreach ($dep in (Get-PackageMetadata -Path $file.FullName -OsArch $OsArch -Build $Build).Dependencies) {
+            $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
+            $matching = @($fwPkgs | Where-Object { $_.Identity.Name -eq $dep.Name -and (-not $expectedFamily -or $_.Identity.Family -eq $expectedFamily) -and ($_.Identity.Arch -eq 'neutral' -or $_.Identity.Arch -eq $dep.Arch) -and $_.Identity.Version -ge $dep.MinVersion })
+            foreach ($fw in $matching) {
+                if ($neededFw.Contains($fw)) { continue }
+                $neededFw.Add($fw)
+                $fwFile = Save-OnlinePackage -Package $fw -Destination $Destination -DeviceAttributes $attrs
+                $downloaded.Add($fwFile); $pendingManifests.Enqueue($fwFile)
             }
-            $problem = Test-PackageFile -Path $part -Package $p
-            if ($problem) {
-                throw "verification failed: $problem"
-            }
-            Move-Item -LiteralPath $part -Destination $target -Force
         }
-        } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-        Write-Log "Downloaded + verified (hash, Microsoft signature): $([IO.Path]::GetFileName($target))"
-        Get-Item -LiteralPath $target
-    })
+    }
+    foreach ($fw in $fwPkgs) {
+        if (-not $neededFw.Contains($fw)) { Write-Log "Not downloading $($fw.Moniker)$($fw.Extension): no requested app declares it" }
+    }
+    $totalMb = [math]::Round(($downloaded | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+    Write-Log "Downloaded $($downloaded.Count) package(s), $totalMb MB"
     $manifest = [ordered]@{
         SchemaVersion = 1
         CreatedUtc = [DateTime]::UtcNow.ToString('o')
@@ -1034,6 +1202,7 @@ try {
         }
     }
     $online = $DownloadOnly -or $Source -eq 'Online' -or ($Source -eq 'Auto' -and -not $hasLocalStore)
+    $script:IsOnline = $online
 
     Write-Log '==== Microsoft Store unattended install starting ===='
     Write-Log "Work dir  : $(if ($WorkDir) { $WorkDir } else { '(none)' })"
@@ -1156,7 +1325,7 @@ try {
             @{ Name = 'App Installer'; Package = $winget; Skip = [bool]$SkipWinget }
         )) {
             if (-not $component.Package -and -not $component.Skip) {
-                $script:FailCount++
+                Add-Failure "Requested app missing from local packages: $($component.Name)"
                 Write-Log "Requested app missing from local packages: $($component.Name). This run is incomplete." 'WARN'
             }
         }
@@ -1187,6 +1356,7 @@ try {
         if ($winget -and -not (Test-OptionalAppDependency $winget $fwCandidates)) { $winget = $null }
         $other = @($other | Where-Object { Test-OptionalAppDependency $_ $fwCandidates })
         $apps = @(@($store, $purchase, $xboxId, $winget) | Where-Object { $null -ne $_ })
+        $fwCandidates = @(Select-RequiredFramework -Frameworks $fwCandidates -Applications @($apps + $other))
         $sortedFw = @(Get-DependencyInstallOrder -Frameworks $fwCandidates -Applications @($apps + $other))
     }
     catch { Write-Log $_.Exception.Message 'ERROR'; return (Complete-Run 4) }
@@ -1197,35 +1367,48 @@ try {
         $null = Install-OnePackage -Package $fw -IsFramework
     }
 
+    # Apps whose install steps succeeded; their result is verified independently below.
+    $installedApps = New-Object System.Collections.Generic.List[object]
     Write-Log '---- Installing Microsoft Store ----'
     $storeOk = Install-OnePackage -Package $store
+    if ($storeOk) { $installedApps.Add($store) }
 
     if ($purchase) {
         Write-Log '---- Installing Store Purchase App ----'
-        $null = Install-OnePackage -Package $purchase
+        if (Install-OnePackage -Package $purchase) { $installedApps.Add($purchase) }
     }
 
     if ($xboxId) {
         Write-Log '---- Installing Xbox Identity Provider ----'
-        $null = Install-OnePackage -Package $xboxId
+        if (Install-OnePackage -Package $xboxId) { $installedApps.Add($xboxId) }
     }
 
     if ($winget) {
         Write-Log '---- Installing Desktop App Installer (winget) ----'
-        $null = Install-OnePackage -Package $winget
+        if (Install-OnePackage -Package $winget) { $installedApps.Add($winget) }
     }
 
     foreach ($o in $other) {
         Write-Log "---- Installing additional package: $($o.File.Name) ----"
-        $null = Install-OnePackage -Package $o
+        if (Install-OnePackage -Package $o) { $installedApps.Add($o) }
+    }
+
+    Write-Log '---- Verifying installation ----'
+    try {
+        if (-not (Test-InstallResult -Applications $installedApps.ToArray() -Frameworks $sortedFw)) { $storeOk = $false }
+    }
+    catch {
+        Write-Log "Verification FAILED: $(Format-ErrorText $_.Exception.Message)" 'ERROR'
+        Add-Failure 'Installation could not be verified'
     }
 
     Write-Log '---- Summary ----'
     Write-Log "Store success : $storeOk"
     Write-Log "Failure count : $script:FailCount"
+    foreach ($failure in $script:Failures) { Write-Log "  - $failure" }
     Write-Log 'TIP(1): Must run elevated; packages come from the work directory or are downloaded from Microsoft.'
     Write-Log 'TIP(2): Licenses discovered dynamically; SkipLicense used when XML absent.'
-    Write-Log 'TIP(3): Frameworks filtered for OS arch (x86 side-by-side kept on x64/arm64).'
+    Write-Log 'TIP(3): Only frameworks the apps declare are installed; Store-installed apps bring their own.'
     Write-Log 'TIP(4): See this log + Event Viewer AppXDeployment-Server if Store will not open.'
     Write-Log 'TIP(5): Reboot recommended on clean LTSC/IoT before using Store/winget.'
 
