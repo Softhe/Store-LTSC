@@ -458,14 +458,16 @@ function Find-InstalledFramework {
             Sort-Object Version -Descending)
     }
     $packages = if ($Scope -eq 'AllUsers') { Get-AppxPackage -AllUsers -Name $Identity.Name -ErrorAction SilentlyContinue } else { Get-AppxPackage -Name $Identity.Name -ErrorAction SilentlyContinue }
-    return @($packages | Where-Object { $_.Publisher -eq $Identity.Publisher -and $_.Architecture.ToString() -eq $Identity.Arch -and [version]$_.Version -ge $Identity.Version } |
+    # A current-user copy that needs repair must not suppress re-registration.
+    return @($packages | Where-Object { $_.Publisher -eq $Identity.Publisher -and $_.Architecture.ToString() -eq $Identity.Arch -and [version]$_.Version -ge $Identity.Version -and ($Scope -ne 'CurrentUser' -or [string]$_.Status -eq 'Ok') } |
         Sort-Object { [version]$_.Version } -Descending)
 }
 
 function Test-InstallResult {
     # Confirms the result with Windows instead of trusting cmdlet success: current-user registration and, when
-    # provisioning, that every app and each of its dependencies is provisioned for new users. Returns $false if the Store is not registered.
-    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Applications)
+    # provisioning, that every app and each dependency of the apps and installed frameworks is provisioned for new users.
+    # Returns $false if the Store is not registered.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Applications, [object[]] $Frameworks = @())
     $storeRegistered = $true
     if (-not $script:IsSystem) {
         foreach ($app in $Applications) {
@@ -482,23 +484,27 @@ function Test-InstallResult {
     if (-not $script:DoProvision) { return $storeRegistered }
 
     $provisioned = @(Get-ProvisionedIdentity -Refresh)
-    $unmet = 0
-    foreach ($app in $Applications) {
-        if (-not ($provisioned | Where-Object { $_.Name -eq $app.Identity.Name -and $_.Family -eq $app.Identity.Family })) {
-            Write-Log "Not provisioned for new users after installation: $($app.Identity.Name)" 'ERROR'
-            Add-Failure "$($app.Identity.Name) is not provisioned for new users"
+    $problems = 0
+    $appNames = @($Applications | ForEach-Object { $_.Identity.Name })
+    # Frameworks' own dependencies count too: an app can rely on them through a framework.
+    foreach ($pkg in @($Applications) + @($Frameworks)) {
+        $isApp = $appNames -contains $pkg.Identity.Name
+        if ($isApp -and -not ($provisioned | Where-Object { $_.Name -eq $pkg.Identity.Name -and $_.Family -eq $pkg.Identity.Family })) {
+            $problems++
+            Write-Log "Not provisioned for new users after installation: $($pkg.Identity.Name)" 'ERROR'
+            Add-Failure "$($pkg.Identity.Name) is not provisioned for new users"
             continue
         }
-        foreach ($dep in $app.Identity.Dependencies) {
+        foreach ($dep in $pkg.Identity.Dependencies) {
             $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
             $match = @($provisioned | Where-Object { $_.Name -eq $dep.Name -and (-not $expectedFamily -or $_.Family -eq $expectedFamily) -and ($_.Arch -eq 'neutral' -or $_.Arch -eq $dep.Arch) -and $_.Version -ge $dep.MinVersion })
             if ($match.Count -gt 0) { continue }
-            $unmet++
-            Write-Log "New users: $($app.Identity.Name) needs $($dep.Name) $($dep.MinVersion) or newer ($($dep.Arch)), which is not provisioned." 'ERROR'
-            Add-Failure "$($dep.Name) ($($dep.Arch)) for $($app.Identity.Name) is not provisioned for new users"
+            $problems++
+            Write-Log "New users: $($pkg.Identity.Name) needs $($dep.Name) $($dep.MinVersion) or newer ($($dep.Arch)), which is not provisioned." 'ERROR'
+            Add-Failure "$($dep.Name) ($($dep.Arch)) for $($pkg.Identity.Name) is not provisioned for new users"
         }
     }
-    if ($unmet -eq 0) {
+    if ($problems -eq 0) {
         Write-Log "Verified (new users): $(@($Applications).Count) app(s) provisioned with all dependencies"
         foreach ($name in $script:SupersededFrameworks) {
             Write-Log "Not provisioning ${name} is harmless: newer provisioned frameworks satisfy every app dependency."
@@ -1389,7 +1395,7 @@ try {
 
     Write-Log '---- Verifying installation ----'
     try {
-        if (-not (Test-InstallResult -Applications $installedApps.ToArray())) { $storeOk = $false }
+        if (-not (Test-InstallResult -Applications $installedApps.ToArray() -Frameworks $sortedFw)) { $storeOk = $false }
     }
     catch {
         Write-Log "Verification FAILED: $(Format-ErrorText $_.Exception.Message)" 'ERROR'

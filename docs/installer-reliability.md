@@ -42,7 +42,7 @@ The Store service can offer a framework older than one already on the system. On
 
 The installer now checks for the same framework name, publisher, and architecture at the same or a newer version. If one is provisioned, it skips provisioning. If one is registered for the current user, it skips registration. If provisioning fails while a newer copy is installed for any user, the installer records a warning instead of a failure.
 
-Verification then decides the result. It checks current-user registration status for each installed app. When provisioning, it checks that every app and each manifest dependency is provisioned at the required version and architecture. A dependency that new users would lack is a partial failure. A Store that is not registered after installation is a Store failure. The summary lists each failure by name.
+Verification then decides the result. It checks current-user registration status for each installed app. When provisioning, it checks that every app, each manifest dependency, and the dependencies of installed frameworks are provisioned at the required version and architecture. A framework copy registered for the current user is reused only when its status is `Ok`. A dependency that new users would lack is a partial failure. A Store that is not registered after installation is a Store failure. The summary lists each failure by name.
 
 ## Exit codes
 

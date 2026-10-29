@@ -24,7 +24,7 @@ function Get-AppxPackage {
 function Add-AppxProvisionedPackage { param([switch]$Online, $PackagePath, $LicensePath, $Regions, [switch]$SkipLicense) $script:ProvisionCalls++; if ($script:ProvisionError) { throw $script:ProvisionError } }
 function Add-AppxPackage { param($Path, [switch]$ForceApplicationShutdown, [switch]$ForceUpdateFromAnyVersion) $script:InstallCalls++ }
 
-function New-Installed($Version, $Arch = 'X64') { [pscustomobject]@{ Name = 'Microsoft.UI.Xaml.2.8'; Version = $Version; Architecture = $Arch; Publisher = $publisher; Status = 'Ok' } }
+function New-Installed($Version, $Arch = 'X64', $Status = 'Ok') { [pscustomobject]@{ Name = 'Microsoft.UI.Xaml.2.8'; Version = $Version; Architecture = $Arch; Publisher = $publisher; Status = $Status } }
 $xaml = [pscustomobject]@{
     File     = [pscustomobject]@{ FullName = 'C:\pkgs\Microsoft.UI.Xaml.2.8_8.2501.31001.0_x64__8wekyb3d8bbwe.appx'; Name = 'Microsoft.UI.Xaml.2.8_8.2501.31001.0_x64__8wekyb3d8bbwe.appx' }
     Identity = [pscustomobject]@{ Name = 'Microsoft.UI.Xaml.2.8'; Version = [version]'8.2501.31001.0'; Arch = 'x64'; Family = 'Microsoft.UI.Xaml.2.8_8wekyb3d8bbwe'; Publisher = $publisher }
@@ -70,6 +70,19 @@ $script:ProvisionedNames += 'Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8
 $storeRegistered = Test-InstallResult -Applications @($store)
 Assert ($storeRegistered -and $script:FailCount -eq 0) 'A newer provisioned framework satisfies the Store dependency.'
 
+# 2c. A framework's own dependency is checked too (app -> UI.Xaml -> nested framework).
+$script:FailCount = 0; $script:Failures.Clear()
+$nestedDep = [pscustomobject]@{ Name = 'Microsoft.Nested.Framework'; Publisher = $publisher; MinVersion = [version]'1.0.0.0'; Arch = 'x64' }
+$xamlWithDep = [pscustomobject]@{ File = $xaml.File; Identity = [pscustomobject]@{ Name = $xaml.Identity.Name; Version = $xaml.Identity.Version; Arch = 'x64'; Family = $xaml.Identity.Family; Publisher = $publisher; Dependencies = @($nestedDep) } }
+$null = Test-InstallResult -Applications @($store) -Frameworks @($xamlWithDep)
+Assert ($script:FailCount -eq 1) 'A nested framework missing for new users must be a partial failure.'
+
+# 2d. An unprovisioned app is not reported as verified.
+$script:FailCount = 0; $script:Failures.Clear(); $script:Log.Clear()
+$script:ProvisionedNames = @('Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8bbwe')
+$null = Test-InstallResult -Applications @($store)
+Assert ($script:FailCount -eq 1 -and -not ($script:Log | Where-Object { $_ -match 'Verified \(new users\)' })) 'An unprovisioned app must not be reported as verified.'
+
 # 3. A provisioning error without a newer framework remains a failure.
 Reset-State -ProvisionError $deploymentError
 $ok = Install-OnePackage -Package $xaml -IsFramework
@@ -84,5 +97,10 @@ Assert ($ok -and $script:ProvisionCalls -eq 1 -and $script:InstallCalls -eq 1) '
 Reset-State -User @(New-Installed '8.2511.26001.0' 'X86') -AllUsers @(New-Installed '8.2511.26001.0' 'X86') -ProvisionError $deploymentError
 $null = Install-OnePackage -Package $xaml -IsFramework
 Assert ($script:FailCount -eq 1) 'An x86 framework must not excuse an x64 provisioning failure.'
+
+# 6. A current-user copy that needs repair is re-registered, not skipped.
+Reset-State -Provisioned @('Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8bbwe') -User @(New-Installed '8.2511.26001.0' 'X64' 'NeedsRemediation') -AllUsers @(New-Installed '8.2511.26001.0')
+$null = Install-OnePackage -Package $xaml -IsFramework
+Assert ($script:InstallCalls -eq 1) 'An unhealthy registered framework must not suppress registration.'
 
 Write-Host 'PASS: superseded frameworks are skipped or deferred to verification, real failures are counted, and errors log on one line.'
