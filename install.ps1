@@ -16,7 +16,7 @@
     and must carry a valid Microsoft Corporation signature.
   - Can also install from a local folder of packages (-Source Local / Auto).
   - Non-interactive, CI/MDT/SSH friendly (also runs as SYSTEM: provisions only)
-  - Logging with timestamps
+  - Compact console output (one status line per package); full timestamped log file
   - Dynamic license discovery (PackageFamilyName.xml) or -SkipLicense
   - Installs only the frameworks the apps declare (newest offered version per architecture)
   - Installs Store, StorePurchaseApp, XboxIdentityProvider, DesktopAppInstaller
@@ -130,6 +130,7 @@ $script:ScriptPath = $Invocation.ScriptPath
 $script:ScriptText = $Invocation.ScriptText
 
 $script:LogFile = $null
+$script:ActiveProgress = $null
 $script:FailCount = 0
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:SupersededFrameworks = New-Object System.Collections.Generic.List[string]
@@ -156,18 +157,94 @@ function Test-IsSystemAccount {
     return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
 }
 
+$script:StatusColors = @{ OK = 'Green'; SKIP = 'DarkCyan'; WARN = 'Yellow'; FAIL = 'Red' }
+$script:AppTitles = @{
+    'Microsoft.WindowsStore'         = 'Microsoft Store'
+    'Microsoft.StorePurchaseApp'     = 'Store Purchase App'
+    'Microsoft.XboxIdentityProvider' = 'Xbox Identity Provider'
+    'Microsoft.DesktopAppInstaller'  = 'App Installer (winget)'
+}
+
+function Write-StatusLine {
+    # Console only: a status column, the text, and an optional dim note. A blank status indents plain text to match.
+    param([AllowEmptyString()][string] $Status, [Parameter(Mandatory)][AllowEmptyString()][string] $Text, [string] $Note)
+    if ($Status) { Write-Host ('    {0,-6}' -f $Status) -ForegroundColor $script:StatusColors[$Status] -NoNewline }
+    else { Write-Host (' ' * 10) -NoNewline }
+    if ($Note) { Write-Host $Text -NoNewline; Write-Host "  $Note" -ForegroundColor DarkGray }
+    else { Write-Host $Text }
+}
+
 function Write-Log {
+    # Every message goes to the log file with a timestamp. The console shows a shorter view without timestamps:
+    # -Quiet keeps a detail out of the console, and -Console replaces the console text.
     param(
         [Parameter(Mandatory)][string] $Message,
-        [ValidateSet('INFO', 'WARN', 'ERROR')][string] $Level = 'INFO'
+        [ValidateSet('INFO', 'WARN', 'ERROR')][string] $Level = 'INFO',
+        [switch] $Quiet,
+        [string] $Console
     )
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = '[{0}] [{1}] {2}' -f $ts, $Level, $Message
+    $saved = $false
     if ($script:LogFile) {
-        try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 }
-        catch { Write-Host "[log write failed: $($_.Exception.Message)]" }
+        try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8; $saved = $true }
+        catch { Write-Host "[log write failed: $($_.Exception.Message)]" -ForegroundColor Yellow }
     }
-    Write-Host $line
+    # Without a log file, details would be lost: show the full message instead of hiding or shortening it.
+    if ($Quiet -and $saved) { return }
+    $text = if ($Console -and $saved) { $Console } else { $Message }
+    $status = switch ($Level) { 'WARN' { 'WARN' } 'ERROR' { 'FAIL' } default { '' } }
+    Write-StatusLine $status $text
+}
+
+function Write-Item {
+    # One result line per package or check; the log file keeps the same text with a timestamp.
+    param(
+        [Parameter(Mandatory)][ValidateSet('OK', 'SKIP', 'WARN', 'FAIL')][string] $Status,
+        [Parameter(Mandatory)][string] $Text,
+        [string] $Note
+    )
+    $level = switch ($Status) { 'WARN' { 'WARN' } 'FAIL' { 'ERROR' } default { 'INFO' } }
+    Write-Log ('{0} {1}{2}' -f $Status, ($Text -replace '\s{2,}', ' ').Trim(), $(if ($Note) { " ($($Note.Trim()))" })) $level -Quiet
+    Write-StatusLine $Status $Text $Note
+}
+
+function Write-Section {
+    param([Parameter(Mandatory)][string] $Title)
+    Write-Log "---- $Title ----" -Quiet
+    Write-Host ''
+    Write-Host "  $Title" -ForegroundColor Cyan
+}
+
+function Show-Progress {
+    # A transient progress bar for long steps. The module silences progress from Appx cmdlets, so enable it locally.
+    param([Parameter(Mandatory)][string] $Activity, [string] $Status = ' ', [int] $Percent = -1, [switch] $Completed)
+    $ProgressPreference = 'Continue'
+    if ($null -eq $script:ActiveProgress) { $script:ActiveProgress = New-Object 'System.Collections.Generic.HashSet[string]' }
+    if ($Completed) { Write-Progress -Activity $Activity -Completed; $null = $script:ActiveProgress.Remove($Activity) }
+    else { Write-Progress -Activity $Activity -Status $Status -PercentComplete $Percent; $null = $script:ActiveProgress.Add($Activity) }
+}
+
+function Clear-Progress {
+    # Closes progress bars left open when a step stops with an error.
+    if ($null -eq $script:ActiveProgress) { return }
+    foreach ($activity in @($script:ActiveProgress)) { Show-Progress -Activity $activity -Completed }
+}
+
+function Format-PackageLabel {
+    # "Microsoft.UI.Xaml.2.8   8.2501.31001.0   x64  ", padded so result lines and their notes form columns.
+    param([Parameter(Mandatory)] $Identity)
+    $name = if ($script:AppTitles.ContainsKey([string]$Identity.Name)) { $script:AppTitles[[string]$Identity.Name] } else { [string]$Identity.Name }
+    $arch = if ($Identity.Arch -and $Identity.Arch -ne 'neutral') { $Identity.Arch } else { '' }
+    return '{0,-36} {1,-16} {2,-5}' -f $name, $Identity.Version, $arch
+}
+
+function Format-Brief {
+    # Shortens an error for the console; the log file keeps the full text.
+    param([AllowNull()][AllowEmptyString()][string] $Text, [int] $Max = 160)
+    $Text = (Format-ErrorText $Text) -replace '\s*NOTE: For additional information.*$', ''
+    if ($Text.Length -le $Max) { return $Text }
+    return $Text.Substring(0, $Max - 3).TrimEnd() + '...'
 }
 
 function Add-Failure {
@@ -184,8 +261,19 @@ function Format-ErrorText {
 }
 
 function Complete-Run {
-    # Cleanup + final log line; returns the exit code (use as: return (Complete-Run 5 'reason')).
-    param([Parameter(Mandatory)][int] $Code, [string] $Reason)
+    # Cleanup, final log line and console result; returns the exit code (use as: return (Complete-Run 5 'reason')).
+    param([Parameter(Mandatory)][int] $Code, [string] $Reason, [string] $Hint)
+    Clear-Progress
+    if (-not $Reason) {
+        $Reason = switch ($Code) {
+            0 { 'Finished' }
+            4 { 'A required package or dependency is missing or invalid' }
+            5 { 'Finished with problems' }
+            6 { 'Microsoft Store could not be installed' }
+            8 { 'Download failed' }
+            default { 'Stopped by an error' }
+        }
+    }
     if ($script:CleanupDir -and (Test-Path -LiteralPath $script:CleanupDir)) {
         try {
             $resolved = [IO.Path]::GetFullPath($script:CleanupDir)
@@ -199,11 +287,19 @@ function Complete-Run {
                 throw 'Refusing cleanup because the temporary directory ownership check failed.'
             }
             Remove-Item -LiteralPath $resolved -Recurse -Force
-            Write-Log "Removed downloaded packages: $script:CleanupDir"
+            Write-Log "Removed downloaded packages: $script:CleanupDir" -Quiet
         }
         catch { Write-Log "Could not remove ${script:CleanupDir}: $($_.Exception.Message)" 'WARN' }
     }
-    Write-Log ('==== finished (exit {0}{1}) ====' -f $Code, $(if ($Reason) { " - $Reason" }))
+    Write-Log ('==== finished (exit {0} - {1}) ====' -f $Code, $Reason) -Quiet
+
+    $color = switch ($Code) { 0 { 'Green' } 5 { 'Yellow' } default { 'Red' } }
+    Write-Host ''
+    Write-Host "  $Reason (exit code $Code)" -ForegroundColor $color
+    if ($Code -ne 0) { foreach ($failure in @($script:Failures)) { if ($failure) { Write-Host "    - $failure" -ForegroundColor $color } } }
+    if ($Hint) { Write-Host "  $Hint" }
+    if ($script:LogFile) { Write-Host "  Log: $script:LogFile" -ForegroundColor DarkGray }
+    Write-Host ''
     return $Code
 }
 
@@ -241,19 +337,19 @@ function Invoke-Relaunch {
         if ($Elevate) { $bound['PauseAtEnd'] = $true }
         # Encode a parameter splat instead of constructing native command-line quoting.
         $parameterData = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes([Management.Automation.PSSerializer]::Serialize($bound)))
-        $bootstrap = '$parameters = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + $parameterData + '''))); & ''' + $file.Replace("'", "''") + ''' @parameters 6>&1; exit $LASTEXITCODE'
+        $bootstrap = '$parameters = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + $parameterData + '''))); & ''' + $file.Replace("'", "''") + ''' @parameters; exit $LASTEXITCODE'
         $argList = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-InputFormat', 'Text', '-OutputFormat', 'Text')
         if (-not $Elevate) { $argList += '-NonInteractive' }
         $argList += '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
 
         if ($Elevate) {
             $cmdLine = $argList -join ' '
-            Write-Host 'Requesting administrator rights (UAC). The install continues in a new window...'
+            Write-Host 'Requesting administrator rights (UAC). The install continues in a new window...' -ForegroundColor Cyan
             $proc = Start-Process -FilePath $psExe -ArgumentList $cmdLine -Verb RunAs -Wait -PassThru
-            Write-Host "Elevated run finished with exit code $($proc.ExitCode)."
+            Write-Host "Elevated run finished with exit code $($proc.ExitCode)." -ForegroundColor DarkGray
             return $proc.ExitCode
         }
-        Write-Host "Re-launching in 64-bit Windows PowerShell: $psExe"
+        Write-Host "Re-launching in 64-bit Windows PowerShell: $psExe" -ForegroundColor DarkGray
         & $psExe @argList | Out-Host   # show the child's output instead of returning it as pipeline data
         return $LASTEXITCODE
     }
@@ -469,17 +565,20 @@ function Test-InstallResult {
     # Returns $false if the Store is not registered.
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Applications, [object[]] $Frameworks = @())
     $storeRegistered = $true
-    if (-not $script:IsSystem) {
+    if (-not $script:IsSystem -and @($Applications).Count -gt 0) {
+        $verified = 0
         foreach ($app in $Applications) {
             $registered = @(Get-AppxPackage -Name $app.Identity.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.Status -eq 'Ok' })
             if ($registered.Count -gt 0) {
-                Write-Log "Verified (current user): $($app.Identity.Name) $($registered[0].Version), status Ok"
+                Write-Log "Verified (current user): $($app.Identity.Name) $($registered[0].Version), status Ok" -Quiet
+                $verified++
                 continue
             }
             Write-Log "Not registered for the current user after installation: $($app.Identity.Name)" 'ERROR'
             Add-Failure "$($app.Identity.Name) is not registered for the current user"
             if ($app.Identity.Name -eq 'Microsoft.WindowsStore') { $storeRegistered = $false }
         }
+        if ($verified -gt 0) { Write-Item OK "This user: $verified of $(@($Applications).Count) app(s) registered and ready" }
     }
     if (-not $script:DoProvision) { return $storeRegistered }
 
@@ -505,9 +604,9 @@ function Test-InstallResult {
         }
     }
     if ($problems -eq 0) {
-        Write-Log "Verified (new users): $(@($Applications).Count) app(s) provisioned with all dependencies"
+        Write-Item OK "New users: $(@($Applications).Count) app(s) provisioned with all dependencies"
         foreach ($name in $script:SupersededFrameworks) {
-            Write-Log "Not provisioning ${name} is harmless: newer provisioned frameworks satisfy every app dependency."
+            Write-Log "Not provisioning ${name} is harmless: newer provisioned frameworks satisfy every app dependency." -Quiet
         }
     }
     return $storeRegistered
@@ -544,9 +643,9 @@ function Select-RequiredFramework {
             if (-not $required.Contains($fw)) { $required.Add($fw); $pending.Enqueue($fw) }
         }
     }
-    foreach ($fw in $Frameworks) {
-        if (-not $required.Contains($fw)) { Write-Log "Skipping framework no app declares: $($fw.File.Name)" }
-    }
+    $unused = @($Frameworks | Where-Object { -not $required.Contains($_) })
+    foreach ($fw in $unused) { Write-Log "Skipping framework no app declares: $($fw.File.Name)" -Quiet }
+    if ($unused.Count -gt 0) { Write-Log "Skipping $($unused.Count) framework package(s) that no app needs" -Quiet:$script:IsOnline }
     return $required.ToArray()
 }
 
@@ -617,6 +716,8 @@ function Select-NewerPackage {
 }
 
 function Install-OnePackage {
+    # Provisions (for new users) and registers (for the current user) one package. Details go to the log file;
+    # the console gets a single result line.
     param(
         [Parameter(Mandatory)] $Package,
         [switch] $IsFramework
@@ -625,27 +726,33 @@ function Install-OnePackage {
     $path = $Package.File.FullName
     $name = $Package.File.Name
     $ok = $true
+    $changed = $false     # something was provisioned or registered
+    $present = $null      # version of a same or newer copy that made a step unnecessary
+    $problem = $null
+    $notes = New-Object System.Collections.Generic.List[string]
 
     # Windows cannot deploy an older copy of a framework that is already present; skip instead of failing.
     $provisioned = @(if ($script:DoProvision -and $IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope Provisioned })
     if ($provisioned.Count -gt 0) {
-        Write-Log "Already provisioned: $name (version $($provisioned[0].Version) present)"
+        Write-Log "Already provisioned: $name (version $($provisioned[0].Version) present)" -Quiet
+        $present = $provisioned[0].Version
     }
     elseif ($script:DoProvision) {
         $license = $null
         if (-not $IsFramework) {
             $license = Find-License -PackagePath $path -Identity $Package.Identity
             if ($license) {
-                Write-Log "License for ${name}: $([IO.Path]::GetFileName($license))"
+                Write-Log "License for ${name}: $([IO.Path]::GetFileName($license))" -Quiet
             }
             else {
                 # Expected for downloaded packages; a local folder may have been meant to include one.
-                Write-Log "No license XML for ${name}; provisioning with -SkipLicense" $(if ($script:IsOnline) { 'INFO' } else { 'WARN' })
+                Write-Log "No license XML for ${name}; provisioning with -SkipLicense" $(if ($script:IsOnline) { 'INFO' } else { 'WARN' }) -Quiet
+                if (-not $script:IsOnline) { $notes.Add('no license file, used -SkipLicense') }
             }
         }
 
         try {
-            Write-Log "Provisioning: $name"
+            Write-Log "Provisioning: $name" -Quiet
             if ($license) {
                 $null = Add-AppxProvisionedPackage -Online -PackagePath $path -LicensePath $license -Regions 'all'
             }
@@ -653,7 +760,8 @@ function Install-OnePackage {
                 $null = Add-AppxProvisionedPackage -Online -PackagePath $path -SkipLicense
             }
             $script:ProvisionedCache = $null
-            Write-Log "Provisioned OK: $name"
+            Write-Log "Provisioned OK: $name" -Quiet
+            $changed = $true
         }
         catch {
             $msg = Format-ErrorText $_.Exception.Message
@@ -661,13 +769,15 @@ function Install-OnePackage {
             # The post-install check decides whether new users still get every dependency.
             $newer = @(if ($IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope AllUsers })
             if ($newer.Count -gt 0) {
-                Write-Log "Provision not applied: $name :: $msg" 'WARN'
-                Write-Log "Version $($newer[0].Version) of this framework is already installed on this machine; new-user dependencies are verified after installation." 'WARN'
+                Write-Log "Provision not applied: $name :: $msg" 'WARN' -Quiet
+                Write-Log "Version $($newer[0].Version) of this framework is already installed on this machine; new-user dependencies are verified after installation." 'WARN' -Quiet
                 $script:SupersededFrameworks.Add($name)
+                $present = $newer[0].Version
             }
             else {
-                Write-Log "Provision FAILED: $name :: $msg" 'ERROR'
+                Write-Log "Provision FAILED: $name :: $msg" 'ERROR' -Quiet
                 $ok = $false
+                $problem = "provisioning failed: $msg"
                 Add-Failure "Provisioning failed: $name"
             }
         }
@@ -675,34 +785,42 @@ function Install-OnePackage {
 
     if ($script:IsSystem) {
         # Add-AppxPackage cannot register packages for the SYSTEM account; provisioning covers all users.
-        Write-Log "Per-user install skipped (running as SYSTEM): $name"
-        return $ok
+        Write-Log "Per-user install skipped (running as SYSTEM): $name" -Quiet
     }
-
-    $registered = @(if ($IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope CurrentUser })
-    if ($registered.Count -gt 0) {
-        Write-Log "Already registered (current user): $name (version $($registered[0].Version) present)"
-        return $ok
-    }
-
-    try {
-        Write-Log "Installing (current user): $name"
-        $null = Add-AppxPackage -Path $path -ForceApplicationShutdown -ForceUpdateFromAnyVersion
-        Write-Log "Install OK: $name"
-    }
-    catch {
-        $msg = Format-ErrorText $_.Exception.Message
-        # Non-fatal: 0x80073D06 = higher version already installed, 0x80073CFB = same identity already installed
-        if ($msg -match '0x80073D06|0x80073CFB|higher version|already installed') {
-            Write-Log "Install skipped/non-fatal: $name :: $msg" 'WARN'
+    else {
+        $registered = @(if ($IsFramework) { Find-InstalledFramework -Identity $Package.Identity -Scope CurrentUser })
+        if ($registered.Count -gt 0) {
+            Write-Log "Already registered (current user): $name (version $($registered[0].Version) present)" -Quiet
+            if (-not $present) { $present = $registered[0].Version }
         }
         else {
-            Write-Log "Install FAILED: $name :: $msg" 'ERROR'
-            $ok = $false
-            Add-Failure "Install failed (current user): $name"
+            try {
+                Write-Log "Installing (current user): $name" -Quiet
+                $null = Add-AppxPackage -Path $path -ForceApplicationShutdown -ForceUpdateFromAnyVersion
+                Write-Log "Install OK: $name" -Quiet
+                $changed = $true
+            }
+            catch {
+                $msg = Format-ErrorText $_.Exception.Message
+                # Non-fatal: 0x80073D06 = higher version already installed, 0x80073CFB = same identity already installed
+                if ($msg -match '0x80073D06|0x80073CFB|higher version|already installed') {
+                    Write-Log "Install skipped/non-fatal: $name :: $msg" 'WARN' -Quiet
+                    if (-not $present -and $msg -match 'higher version (\d+(?:\.\d+){1,3})') { $present = $Matches[1] }
+                }
+                else {
+                    Write-Log "Install FAILED: $name :: $msg" 'ERROR' -Quiet
+                    $ok = $false
+                    if (-not $problem) { $problem = "install failed: $msg" }
+                    Add-Failure "Install failed (current user): $name"
+                }
+            }
         }
     }
 
+    $label = Format-PackageLabel $Package.Identity
+    if (-not $ok) { Write-Item FAIL $label (Format-Brief $problem) }
+    elseif ($changed) { Write-Item OK $label ($notes -join '; ') }
+    else { Write-Item SKIP $label $(if ($present) { "version $present already installed" } else { 'already installed' }) }
     return $ok
 }
 # endregion
@@ -958,8 +1076,11 @@ function Save-OnlinePackage {
     $p = $Package
     if (($p.Moniker + $p.Extension) -match '[\\/:*?"<>|]' -or $p.Moniker -match '^\.') { throw 'Service returned an unsafe package filename' }
     $target = Join-Path $Destination ($p.Moniker + $p.Extension)
+    $label = Format-PackageLabel $p.Identity
+    $size = '{0,8:N1} MB' -f ($p.Size / 1MB)
     if ((Test-Path -LiteralPath $target -PathType Leaf) -and -not (Test-PackageFile -Path $target -Package $p)) {
-        Write-Log "Already downloaded (verified): $([IO.Path]::GetFileName($target))"
+        Write-Log "Already downloaded (verified): $([IO.Path]::GetFileName($target))" -Quiet
+        Write-Item OK $label "$size, already downloaded"
         return (Get-Item -LiteralPath $target)
     }
 
@@ -968,7 +1089,8 @@ function Save-OnlinePackage {
         $null = Invoke-WithRetry -What "Download of $($p.Moniker)" -Action {
             # URLs are short-lived; request a fresh one per attempt.
             $url = Get-Fe3FileUrl -Package $p -DeviceAttributes $DeviceAttributes
-            Write-Log ('Downloading {0} ({1:N1} MB)' -f [IO.Path]::GetFileName($target), ($p.Size / 1MB))
+            Write-Log ('Downloading {0} ({1:N1} MB)' -f [IO.Path]::GetFileName($target), ($p.Size / 1MB)) -Quiet
+            Show-Progress -Activity 'Downloading packages from Microsoft' -Status ('{0} ({1:N1} MB)' -f $p.Identity.Name, ($p.Size / 1MB))
             Save-PackageDownload -Url $url -Path $part -TimeoutSeconds $DownloadTimeoutSeconds
             $problem = Test-PackageFile -Path $part -Package $p -SkipSignature
             if ($problem) {
@@ -982,7 +1104,8 @@ function Save-OnlinePackage {
             Move-Item -LiteralPath $part -Destination $target -Force
         }
     } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-    Write-Log "Downloaded + verified (hash, Microsoft signature): $([IO.Path]::GetFileName($target))"
+    Write-Log "Downloaded + verified (hash, Microsoft signature): $([IO.Path]::GetFileName($target))" -Quiet
+    Write-Item OK $label $size
     return (Get-Item -LiteralPath $target)
 }
 
@@ -1002,9 +1125,10 @@ function Save-OnlinePackages {
     $lookupFailed = @{}
     foreach ($fam in $Families) {
         try {
+            Show-Progress -Activity 'Looking up packages in the Microsoft Store catalog' -Status ($fam -replace '_.*$') -Percent ([array]::IndexOf($Families, $fam) * 100 / $Families.Count)
             $cat = Get-WuCategoryId -PackageFamilyName $fam
             $list = @(Get-Fe3PackageList -CategoryId $cat -Cookie $cookie -DeviceAttributes $attrs)
-            Write-Log "Catalog: $fam -> category $cat, $($list.Count) package(s) offered"
+            Write-Log "Catalog: $fam -> category $cat, $($list.Count) package(s) offered" -Quiet
             foreach ($p in $list) { $offered[$p.Moniker] = $p }
         }
         catch {
@@ -1013,6 +1137,7 @@ function Save-OnlinePackages {
             Write-Log "Online lookup failed for ${fam}: $($_.Exception.Message)" 'WARN'
         }
     }
+    Show-Progress -Activity 'Looking up packages in the Microsoft Store catalog' -Completed
 
     # Skip encrypted (.eappx*) packages and architectures this machine cannot use.
     $usable = foreach ($p in $offered.Values) {
@@ -1050,8 +1175,8 @@ function Save-OnlinePackages {
     # their manifests declare (and what those frameworks declare in turn).
     $appPkgs = @($selected | Where-Object { -not $script:OnlineFrameworkNames.Contains($_.Identity.Name) })
     $fwPkgs = @($selected | Where-Object { $script:OnlineFrameworkNames.Contains($_.Identity.Name) })
-    Write-Log "Offered: $($appPkgs.Count) app package(s), $($fwPkgs.Count) framework package(s); download folder: $Destination"
-    foreach ($p in $selected) { Write-Log ('  {0}{1} ({2:N1} MB)' -f $p.Moniker, $p.Extension, ($p.Size / 1MB)) }
+    Write-Log "Offered: $($appPkgs.Count) app package(s), $($fwPkgs.Count) framework package(s); download folder: $Destination" -Quiet
+    foreach ($p in $selected) { Write-Log ('  {0}{1} ({2:N1} MB)' -f $p.Moniker, $p.Extension, ($p.Size / 1MB)) -Quiet }
     if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
         $null = New-Item -ItemType Directory -Path $Destination -Force
     }
@@ -1079,11 +1204,13 @@ function Save-OnlinePackages {
             }
         }
     }
+    Show-Progress -Activity 'Downloading packages from Microsoft' -Completed
     foreach ($fw in $fwPkgs) {
-        if (-not $neededFw.Contains($fw)) { Write-Log "Not downloading $($fw.Moniker)$($fw.Extension): no requested app declares it" }
+        if (-not $neededFw.Contains($fw)) { Write-Log "Not downloading $($fw.Moniker)$($fw.Extension): no requested app declares it" -Quiet }
     }
     $totalMb = [math]::Round(($downloaded | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
-    Write-Log "Downloaded $($downloaded.Count) package(s), $totalMb MB"
+    $unneeded = $fwPkgs.Count - $neededFw.Count
+    Write-Log "Downloaded $($downloaded.Count) package(s), $totalMb MB" -Console ("{0} package(s), {1:N1} MB, hashes and Microsoft signatures verified{2}" -f $downloaded.Count, $totalMb, $(if ($unneeded -gt 0) { "; skipped $unneeded framework(s) no app needs" }))
     $manifest = [ordered]@{
         SchemaVersion = 1
         CreatedUtc = [DateTime]::UtcNow.ToString('o')
@@ -1105,13 +1232,13 @@ function Save-OnlinePackages {
 try {
     # Pre-flight (language mode first: the checks below need .NET method calls that ConstrainedLanguage blocks)
     if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
-        Write-Host 'ERROR: PowerShell FullLanguage mode is required.'
+        Write-Host 'ERROR: PowerShell FullLanguage mode is required.' -ForegroundColor Red
         return 3
     }
 
     # -DownloadOnly installs nothing, so it needs neither admin rights nor a supported build.
     if ($DownloadOnly -and $Source -eq 'Local') {
-        Write-Host 'ERROR: -DownloadOnly cannot be combined with -Source Local.'
+        Write-Host 'ERROR: -DownloadOnly cannot be combined with -Source Local.' -ForegroundColor Red
         return 7
     }
 
@@ -1124,12 +1251,12 @@ try {
 
     if (-not $DownloadOnly -and -not (Test-IsElevated)) {
         if (-not (Test-CanPromptForElevation)) {
-            Write-Host 'ERROR: Run this script as Administrator.'
+            Write-Host 'ERROR: Run this script as Administrator.' -ForegroundColor Red
             return 1
         }
         try { return (Invoke-Relaunch -Elevate) }
         catch {
-            Write-Host "ERROR: Administrator rights are required ($($_.Exception.Message))."
+            Write-Host "ERROR: Administrator rights are required ($($_.Exception.Message))." -ForegroundColor Red
             return 1
         }
     }
@@ -1144,13 +1271,13 @@ try {
     $revision = 0
     if ($osVersionInfo.PSObject.Properties['UBR']) { $revision = [int]$osVersionInfo.UBR }
     if (-not $DownloadOnly -and $build -lt 19041) {
-        Write-Host 'ERROR: Requires Windows build 19041 or later.'
+        Write-Host 'ERROR: Requires Windows build 19041 or later.' -ForegroundColor Red
         return 2
     }
 
     if ($WorkDir) {
         if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) {
-            Write-Host "ERROR: WorkDir not found: $WorkDir"
+            Write-Host "ERROR: WorkDir not found: $WorkDir" -ForegroundColor Red
             return 7
         }
     }
@@ -1158,7 +1285,7 @@ try {
     $script:IsSystem = Test-IsSystemAccount
     $script:DoProvision = -not $NoProvision
     if ($script:IsSystem -and -not $script:DoProvision -and -not $DownloadOnly) {
-        Write-Host 'ERROR: -NoProvision cannot be used as SYSTEM (per-user install is not possible for SYSTEM).'
+        Write-Host 'ERROR: -NoProvision cannot be used as SYSTEM (per-user install is not possible for SYSTEM).' -ForegroundColor Red
         return 7
     }
 
@@ -1180,7 +1307,7 @@ try {
             break
         }
         catch {
-            Write-Host "WARN: Cannot write log in ${dir}: $($_.Exception.Message)"
+            Write-Host "WARN: Cannot write log in ${dir}: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
@@ -1204,21 +1331,40 @@ try {
     $online = $DownloadOnly -or $Source -eq 'Online' -or ($Source -eq 'Auto' -and -not $hasLocalStore)
     $script:IsOnline = $online
 
-    Write-Log '==== Microsoft Store unattended install starting ===='
-    Write-Log "Work dir  : $(if ($WorkDir) { $WorkDir } else { '(none)' })"
-    Write-Log "Log file  : $(if ($script:LogFile) { $script:LogFile } else { '(console only)' })"
-    Write-Log "User      : $env:USERDOMAIN\$env:USERNAME$(if ($script:IsSystem) { ' (SYSTEM: provisioning only)' })"
-    Write-Log "Computer  : $env:COMPUTERNAME"
-    Write-Log "Build     : $build"
-    Write-Log "OS arch   : $osArch (PROCESSOR_ARCHITECTURE=$($env:PROCESSOR_ARCHITECTURE), W6432=$($env:PROCESSOR_ARCHITEW6432))"
-    Write-Log "Source    : $(if ($online) { 'Online (Microsoft Store delivery service)' } else { 'Local (work dir)' })$(if ($Source -eq 'Auto') { ' [auto]' })"
-    Write-Log "Provision : $($script:DoProvision -and -not $DownloadOnly)"
-    Write-Log "SkipWinget: $([bool]$SkipWinget)"
+    Write-Log '==== Microsoft Store unattended install starting ====' -Quiet
+    Write-Log "Work dir  : $(if ($WorkDir) { $WorkDir } else { '(none)' })" -Quiet
+    Write-Log "Log file  : $(if ($script:LogFile) { $script:LogFile } else { '(console only)' })" -Quiet
+    Write-Log "User      : $env:USERDOMAIN\$env:USERNAME$(if ($script:IsSystem) { ' (SYSTEM: provisioning only)' })" -Quiet
+    Write-Log "Computer  : $env:COMPUTERNAME" -Quiet
+    Write-Log "Build     : $build.$revision" -Quiet
+    Write-Log "OS arch   : $osArch (PROCESSOR_ARCHITECTURE=$($env:PROCESSOR_ARCHITECTURE), W6432=$($env:PROCESSOR_ARCHITEW6432))" -Quiet
+    Write-Log "Source    : $(if ($online) { 'Online (Microsoft Store delivery service)' } else { 'Local (work dir)' })$(if ($Source -eq 'Auto') { ' [auto]' })" -Quiet
+    Write-Log "Provision : $($script:DoProvision -and -not $DownloadOnly)" -Quiet
+    Write-Log "SkipWinget: $([bool]$SkipWinget)" -Quiet
 
     $script:LicenseDirs = @($WorkDir | Where-Object { $_ })
 
     $families = @($script:StoreFamily) + $script:OptionalFamilies
     if (-not $SkipWinget) { $families += $script:WingetFamily }
+
+    $title = 'Microsoft Store installer for Windows LTSC'
+    Write-Host ''
+    Write-Host "  $title" -ForegroundColor Cyan
+    Write-Host ('  ' + '=' * $title.Length) -ForegroundColor DarkCyan
+    $mode = if ($DownloadOnly) { 'Download only (nothing is installed)' }
+        elseif ($script:IsSystem) { 'New users (running as SYSTEM: provisioning only)' }
+        elseif (-not $script:DoProvision) { 'This user only' }
+        else { 'This user and new users' }
+    foreach ($field in @(
+            @('Windows', "Build $build.$revision, $osArch"),
+            @('Account', "$env:USERDOMAIN\$env:USERNAME"),
+            @('Source', $(if ($online) { 'Microsoft Store delivery service (online)' } else { "Local folder: $WorkDir" })),
+            @('Install', $mode),
+            @('Apps', (($families | ForEach-Object { $script:AppTitles[$_ -replace '_.*$'] }) -join ', ')),
+            @('Log', $(if ($script:LogFile) { $script:LogFile } else { '(console only)' })))) {
+        Write-Host ('    {0,-10}' -f $field[0]) -ForegroundColor DarkGray -NoNewline
+        Write-Host $field[1]
+    }
 
     if ($online) {
         if ($DownloadDir) {
@@ -1235,24 +1381,26 @@ try {
             }
         }
 
-        Write-Log '---- Downloading packages from Microsoft ----'
+        Write-Section 'Downloading packages from Microsoft'
         try {
             $all = @(Save-OnlinePackages -Destination $pkgDir -Families $families -OsArch $osArch -Build $build)
         }
         catch {
+            Clear-Progress
             Write-Log "Download FAILED: $($_.Exception.Message)" 'ERROR'
             Write-Log 'Check internet access to displaycatalog.mp.microsoft.com, fe3.delivery.mp.microsoft.com and *.dl.delivery.mp.microsoft.com (proxy/firewall).' 'ERROR'
-            return (Complete-Run 8 'download failed')
+            return (Complete-Run 8 'Download failed')
         }
 
         if ($DownloadOnly) {
-            Write-Log "Downloaded $($all.Count) package(s) to $pkgDir"
-            Write-Log "Install later with: -Source Local -WorkDir `"$pkgDir`""
-            if ($script:FailCount -gt 0) { return (Complete-Run 5 'download set incomplete') }
-            return (Complete-Run 0 'download only')
+            Write-Log "Downloaded $($all.Count) package(s) to $pkgDir" -Quiet
+            $hint = "Folder: $pkgDir`n  Install later with: -Source Local -WorkDir `"$pkgDir`""
+            if ($script:FailCount -gt 0) { return (Complete-Run 5 'Download set is incomplete' $hint) }
+            return (Complete-Run 0 'Packages downloaded' $hint)
         }
     }
     else {
+        Write-Section 'Checking local packages'
         $all = $localPkgs
         if (-not $WorkDir) {
             Write-Log 'No WorkDir for local packages (use -WorkDir).' 'ERROR'
@@ -1268,7 +1416,7 @@ try {
             foreach ($e in $unblockErr) { Write-Log "Unblock-File warning: $($e.Exception.Message)" 'WARN' }
         }
         else {
-            Write-Log 'Unblocked files in work directory (Mark-of-the-Web)'
+            Write-Log 'Unblocked files in work directory (Mark-of-the-Web)' -Quiet
         }
     }
 
@@ -1276,7 +1424,7 @@ try {
         Write-Log 'No Appx/Msix/Bundle packages found.' 'ERROR'
         return (Complete-Run 7)
     }
-    Write-Log "Found $($all.Count) package file(s)"
+    Write-Log "Found $($all.Count) package file(s)" -Quiet:$online
 
     $frameworks = New-Object System.Collections.Generic.List[object]
     $other = New-Object System.Collections.Generic.List[object]
@@ -1331,15 +1479,15 @@ try {
         }
     }
 
-    Write-Log "Store               : $($store.File.Name)"
-    Write-Log ('PurchaseApp         : {0}' -f $(if ($purchase) { $purchase.File.Name } else { '(not present)' }))
-    Write-Log ('XboxIdentityProvider: {0}' -f $(if ($xboxId) { $xboxId.File.Name } else { '(not present)' }))
+    Write-Log "Store               : $($store.File.Name)" -Quiet
+    Write-Log ('PurchaseApp         : {0}' -f $(if ($purchase) { $purchase.File.Name } else { '(not present)' })) -Quiet
+    Write-Log ('XboxIdentityProvider: {0}' -f $(if ($xboxId) { $xboxId.File.Name } else { '(not present)' })) -Quiet
     if ($winget -and $SkipWinget) {
-        Write-Log 'DesktopAppInstaller : present but skipped (-SkipWinget)'
+        Write-Log 'DesktopAppInstaller : present but skipped (-SkipWinget)' -Quiet
         $winget = $null
     }
     else {
-        Write-Log ('DesktopAppInstaller : {0}' -f $(if ($winget) { $winget.File.Name } else { '(not present)' }))
+        Write-Log ('DesktopAppInstaller : {0}' -f $(if ($winget) { $winget.File.Name } else { '(not present)' })) -Quiet
     }
 
     # Keep the newest package per identity and architecture before dependency validation.
@@ -1361,39 +1509,33 @@ try {
     }
     catch { Write-Log $_.Exception.Message 'ERROR'; return (Complete-Run 4) }
 
-    Write-Log '---- Installing framework dependencies ----'
-    foreach ($fw in $sortedFw) {
-        Write-Log ('Framework (rank {0}): {1}' -f $fw.Rank, $fw.File.Name)
-        $null = Install-OnePackage -Package $fw -IsFramework
-    }
-
     # Apps whose install steps succeeded; their result is verified independently below.
     $installedApps = New-Object System.Collections.Generic.List[object]
-    Write-Log '---- Installing Microsoft Store ----'
-    $storeOk = Install-OnePackage -Package $store
-    if ($storeOk) { $installedApps.Add($store) }
-
-    if ($purchase) {
-        Write-Log '---- Installing Store Purchase App ----'
-        if (Install-OnePackage -Package $purchase) { $installedApps.Add($purchase) }
+    $appQueue = @(@($store, $purchase, $xboxId, $winget) + @($other) | Where-Object { $null -ne $_ })
+    $total = $sortedFw.Count + $appQueue.Count
+    $done = 0
+    $storeOk = $false
+    if ($sortedFw.Count -gt 0) { Write-Section 'Installing frameworks' }
+    foreach ($fw in $sortedFw) {
+        Write-Log ('Framework (rank {0}): {1}' -f $fw.Rank, $fw.File.Name) -Quiet
+        Show-Progress -Activity 'Installing' -Status "$($fw.Identity.Name) ($($done + 1) of $total)" -Percent ($done * 100 / $total)
+        $null = Install-OnePackage -Package $fw -IsFramework
+        $done++
     }
 
-    if ($xboxId) {
-        Write-Log '---- Installing Xbox Identity Provider ----'
-        if (Install-OnePackage -Package $xboxId) { $installedApps.Add($xboxId) }
+    Write-Section 'Installing apps'
+    foreach ($app in $appQueue) {
+        $title = if ($script:AppTitles.ContainsKey($app.Identity.Name)) { $script:AppTitles[$app.Identity.Name] } else { $app.Identity.Name }
+        Write-Log "Installing $title`: $($app.File.Name)" -Quiet
+        Show-Progress -Activity 'Installing' -Status "$title ($($done + 1) of $total)" -Percent ($done * 100 / $total)
+        $appOk = Install-OnePackage -Package $app
+        if ($appOk) { $installedApps.Add($app) }
+        if ($app -eq $store) { $storeOk = $appOk }
+        $done++
     }
+    Show-Progress -Activity 'Installing' -Completed
 
-    if ($winget) {
-        Write-Log '---- Installing Desktop App Installer (winget) ----'
-        if (Install-OnePackage -Package $winget) { $installedApps.Add($winget) }
-    }
-
-    foreach ($o in $other) {
-        Write-Log "---- Installing additional package: $($o.File.Name) ----"
-        if (Install-OnePackage -Package $o) { $installedApps.Add($o) }
-    }
-
-    Write-Log '---- Verifying installation ----'
+    Write-Section 'Verifying'
     try {
         if (-not (Test-InstallResult -Applications $installedApps.ToArray() -Frameworks $sortedFw)) { $storeOk = $false }
     }
@@ -1402,21 +1544,19 @@ try {
         Add-Failure 'Installation could not be verified'
     }
 
-    Write-Log '---- Summary ----'
-    Write-Log "Store success : $storeOk"
-    Write-Log "Failure count : $script:FailCount"
-    foreach ($failure in $script:Failures) { Write-Log "  - $failure" }
-    Write-Log 'TIP(1): Must run elevated; packages come from the work directory or are downloaded from Microsoft.'
-    Write-Log 'TIP(2): Licenses discovered dynamically; SkipLicense used when XML absent.'
-    Write-Log 'TIP(3): Only frameworks the apps declare are installed; Store-installed apps bring their own.'
-    Write-Log 'TIP(4): See this log + Event Viewer AppXDeployment-Server if Store will not open.'
-    Write-Log 'TIP(5): Reboot recommended on clean LTSC/IoT before using Store/winget.'
+    Write-Log '---- Summary ----' -Quiet
+    Write-Log "Store success : $storeOk" -Quiet
+    Write-Log "Failure count : $script:FailCount" -Quiet
+    foreach ($failure in $script:Failures) { Write-Log "  - $failure" -Quiet }
+    Write-Log 'If the Store does not open, see Event Viewer > Applications and Services Logs > Microsoft > Windows > AppXDeployment-Server.' -Quiet
 
-    if (-not $storeOk) { return (Complete-Run 6 'critical Store failure') }
-    if ($script:FailCount -gt 0) { return (Complete-Run 5 'partial failure') }
-    return (Complete-Run 0 'success')
+    $hint = 'Restart Windows before you use the Store or winget for the first time.'
+    if (-not $storeOk) { return (Complete-Run 6 'Microsoft Store could not be installed' 'See the log and Event Viewer > Microsoft > Windows > AppXDeployment-Server.') }
+    if ($script:FailCount -gt 0) { return (Complete-Run 5 'Microsoft Store is installed, with problems' $hint) }
+    return (Complete-Run 0 'Microsoft Store is installed' $hint)
 }
 catch {
+    Clear-Progress
     Write-Log "FATAL: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))" 'ERROR'
     return (Complete-Run 7)
 }
@@ -1426,8 +1566,7 @@ catch {
 $StoreLtscExitCode = @($StoreLtscExitCode) | Select-Object -Last 1
 $StoreLtscExitCode = if ($StoreLtscExitCode -is [int]) { $StoreLtscExitCode } else { 7 }
 if ($PauseAtEnd) {
-    Write-Host ''
-    $null = Read-Host "Finished with exit code $StoreLtscExitCode. Press Enter to close"
+    $null = Read-Host '  Press Enter to close this window'
 }
 if ($OriginalScriptPath) { exit $StoreLtscExitCode }
 

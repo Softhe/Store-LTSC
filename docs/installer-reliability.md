@@ -6,7 +6,7 @@ Use the named options in `install.ps1`. The script supports Windows PowerShell 5
 
 The online command runs parameter binding and implementation variables in child scopes. It reports its result through `$LASTEXITCODE` without deleting existing variables from the calling session.
 
-Each default download folder has a unique name under the temporary directory. The script deletes that folder only when its path and ownership marker match the current run. `-KeepDownloads`, `-DownloadOnly`, and an explicit `-DownloadDir` preserve downloads. The script prints the selected folder in its log.
+Each default download folder has a unique name under the temporary directory. The script deletes that folder only when its path and ownership marker match the current run. `-KeepDownloads`, `-DownloadOnly`, and an explicit `-DownloadDir` preserve downloads. The log file records the selected folder. Download-only runs also print it at the end.
 
 `-DownloadTimeoutSeconds` limits each package download attempt. The default is 1800 seconds, and the accepted range is 1 through 86400 seconds. The downloader cancels a transfer that exceeds this limit. Metadata requests have separate timeouts. Retries mean the total run can take longer than one download deadline.
 
