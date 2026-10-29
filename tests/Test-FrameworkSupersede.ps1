@@ -6,7 +6,7 @@ Set-StrictMode -Version Latest
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\install.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-$names = @('Install-OnePackage', 'Find-InstalledFramework', 'Get-ProvisionedIdentity', 'Get-PackageIdentity', 'Get-PublisherId', 'Add-Failure', 'Format-ErrorText', 'Find-License', 'Test-InstallResult')
+$names = @('Install-OnePackage', 'Find-InstalledFramework', 'Get-ProvisionedIdentity', 'Get-PackageIdentity', 'Get-PublisherId', 'Add-Failure', 'Format-ErrorText', 'Find-License', 'Test-InstallResult', 'Format-PackageLabel', 'Format-Brief')
 foreach ($node in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
@@ -14,7 +14,9 @@ function Assert { param($Condition, $Message) if (-not $Condition) { throw $Mess
 
 $publisher = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
 $script:Log = New-Object System.Collections.Generic.List[string]
-function Write-Log { param($Message, $Level = 'INFO') $script:Log.Add("[$Level] $Message") }
+function Write-Log { param($Message, $Level = 'INFO', [switch]$Quiet, $Console) $script:Log.Add("[$Level] $Message") }
+function Write-Item { param($Status, $Text, $Note) $script:Log.Add("ITEM $Status $Text ($Note)") }
+$script:AppTitles = @{}
 function Get-AppxProvisionedPackage { param([switch]$Online, $ErrorAction) foreach ($n in $script:ProvisionedNames) { [pscustomobject]@{ PackageName = $n } } }
 function Get-AppxPackage {
     param($Name, [switch]$AllUsers, $ErrorAction)
@@ -58,6 +60,7 @@ $ok = Install-OnePackage -Package $xaml -IsFramework
 Assert ($ok -and $script:FailCount -eq 0 -and $script:SupersededFrameworks.Count -eq 1) 'A provisioning rejection caused by a newer framework must be deferred, not counted.'
 Assert ($script:InstallCalls -eq 0) 'Current-user registration must be skipped when a newer framework is registered.'
 Assert (-not ($script:Log | Where-Object { $_ -match '\r|\n' })) 'Multi-line deployment errors must be logged on one line.'
+Assert (@($script:Log | Where-Object { $_ -like 'ITEM *' }).Count -eq 1 -and ($script:Log -match '^ITEM SKIP .*version 8\.2511\.26001\.0 already installed')) 'The console must show one SKIP line naming the newer version.'
 
 # 2a. Verification counts the failure when new users would lack the dependency.
 $script:ProvisionedNames = @('Microsoft.WindowsStore_22609.1401.8.0_neutral_~_8wekyb3d8bbwe'); $script:UserPackages += [pscustomobject]@{ Name = 'Microsoft.WindowsStore'; Version = '22609.1401.8.0'; Status = 'Ok' }
@@ -81,7 +84,7 @@ Assert ($script:FailCount -eq 1) 'A nested framework missing for new users must 
 $script:FailCount = 0; $script:Failures.Clear(); $script:Log.Clear()
 $script:ProvisionedNames = @('Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8bbwe')
 $null = Test-InstallResult -Applications @($store)
-Assert ($script:FailCount -eq 1 -and -not ($script:Log | Where-Object { $_ -match 'Verified \(new users\)' })) 'An unprovisioned app must not be reported as verified.'
+Assert ($script:FailCount -eq 1 -and -not ($script:Log | Where-Object { $_ -match 'New users: .* provisioned' })) 'An unprovisioned app must not be reported as verified.'
 
 # 3. A provisioning error without a newer framework remains a failure.
 Reset-State -ProvisionError $deploymentError

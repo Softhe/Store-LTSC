@@ -87,7 +87,7 @@ The script installs frameworks in dependency order, followed by Microsoft Store 
 
 Windows cannot deploy an older copy of a framework that is already present. When the same framework is already provisioned or registered at the same or a newer version, the script skips that step. If provisioning rejects an older framework because a newer one is installed, the script logs a warning and defers the decision to verification.
 
-After installation, the script asks Windows for the result. It confirms that each installed app is registered for the current user with status `Ok`. When provisioning, it also confirms that each app is provisioned and that every dependency is provisioned at the required version for new users. Anything not confirmed is a partial failure, and the log summary lists every failure by name.
+After installation, the script asks Windows for the result. It confirms that each installed app is registered for the current user with status `Ok`. When provisioning, it also confirms that each app is provisioned and that every dependency is provisioned at the required version for new users. Anything not confirmed is a partial failure, and the final summary lists every failure by name.
 
 When run as SYSTEM, such as through Intune, SCCM, or MDT, the script only provisions packages. Windows registers them for users at sign-in. Do not combine SYSTEM execution with `-NoProvision`.
 
@@ -99,7 +99,9 @@ The online downloader relies on an undocumented Microsoft service. Changes to th
 
 ## Logs and troubleshooting
 
-The script prints its log path when installation starts. Saved copies normally write logs to `Logs` inside the working folder. When run through the online command, or if that folder is not writable, logs go to `%TEMP%\StoreInstall-Logs`.
+The console shows a short summary of the run: one line per package with its status (`OK`, `SKIP`, `WARN`, or `FAIL`), the verification results, and the outcome with its exit code. Problems are listed again at the end. The log file keeps every step with timestamps, including package file names and complete error messages.
+
+The script prints its log path when installation starts and again at the end. Saved copies normally write logs to `Logs` inside the working folder. When run through the online command, or if that folder is not writable, logs go to `%TEMP%\StoreInstall-Logs`.
 
 If Microsoft Store does not open, reboot after a fresh Windows installation, then check the installation log. You can also check Event Viewer under `Applications and Services Logs > Microsoft > Windows > AppXDeployment-Server`.
 

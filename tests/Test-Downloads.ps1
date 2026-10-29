@@ -9,6 +9,9 @@ foreach ($name in @('Test-OfflineManifest', 'Save-OnlinePackages', 'Test-Package
     . ([scriptblock]::Create($node.Extent.Text))
 }
 function Write-Log { param($Message, $Level) }
+function Write-Item { param($Status, $Text, $Note) }
+function Show-Progress { param($Activity, $Status, $Percent, [switch]$Completed) }
+function Format-PackageLabel { param($Identity) $Identity.Name }
 function Get-AuthenticodeSignature { param($LiteralPath) [pscustomobject]@{Status='Valid'; SignerCertificate=[pscustomobject]@{Subject='CN=Microsoft Corporation, O=Microsoft Corporation'}} }
 function Assert-Throws { param([scriptblock]$Action, [string]$Pattern) try { & $Action; throw 'Expected rejection was absent' } catch { if ($_.Exception.Message -notmatch $Pattern) { throw } } }
 $folder = Join-Path ([IO.Path]::GetTempPath()) ('StoreLtsc-test-' + [guid]::NewGuid().ToString('N'))
