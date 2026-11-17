@@ -31,11 +31,12 @@ $safeSource = $installerText.Remove($moduleCommand.Extent.StartOffset, $moduleCo
 }
 
 # Load the actual functions without running the installer.
-foreach ($name in @('Complete-Run', 'Invoke-Relaunch', 'Clear-Progress')) {
+foreach ($name in @('Complete-Run', 'Invoke-Relaunch', 'Get-WindowsPowerShellModulePath', 'Remove-OwnedDownloadDir', 'Restore-Network', 'Restore-Console', 'Clear-LiveLine', 'Format-Duration')) {
     $definition = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object Name -eq $name | Select-Object -First 1
     Invoke-Expression $definition.Extent.Text
 }
 function Write-Log { param($Message, $Level) }
+function Write-Host { }   # the summary Complete-Run prints is not under test here
 $script:CleanupToken = [guid]::NewGuid().ToString('N')
 $script:CleanupDir = Join-Path ([IO.Path]::GetTempPath()) ('StoreInstall-Packages-' + $script:CleanupToken)
 $null = New-Item -ItemType Directory -Path $script:CleanupDir
@@ -56,7 +57,9 @@ $script:BoundParams = @{ Source = 'Local'; WorkDir = 'C:\offline packages' }
 $WorkDir = $script:BoundParams.WorkDir
 # Mock only process creation. Capture and inspect the real snapshot before its cleanup.
 function Start-Process {
-    param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru)
+    param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru, [switch]$NoNewWindow)
+    # Only the UAC launch is mocked; the same-console relaunch starts the real child process.
+    if (-not $Verb) { return (Microsoft.PowerShell.Management\Start-Process @PSBoundParameters) }
     $bootstrap = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($ArgumentList -split ' ')[-1]))
     Assert-True ($bootstrap -match "& '([^']+install\.ps1)' @parameters") 'Missing relaunch script path.'
     $snapshotPath = $Matches[1]
@@ -87,4 +90,14 @@ $script:BoundParams = @{ Source = 'Local'; DownloadOnly = $true; WorkDir = ''; S
 $WorkDir = ''
 $result = Invoke-Relaunch
 Assert-True ($result -eq 7) 'Real child relaunch lost serialized parameters or its exit code.'
+
+# powershell.exe -File (the launcher's call) passes "-Switch:$false" as "-Switch" and the text "$false": it must still parse.
+$installer = Join-Path $PSScriptRoot '..\install.ps1'
+$winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$out = & $winPs -NoProfile -NonInteractive -File $installer -DownloadOnly:`$false -Source Local -WorkDir 'C:\store-ltsc-missing-folder' 2>&1 | Out-String
+# Parsed as false, the run goes on to the elevation check (not elevated: exit 1) or the folder check (exit 7).
+Assert-True ($out -notmatch 'Expected a named parameter' -and (($LASTEXITCODE -eq 7 -and $out -match 'WorkDir not found') -or ($LASTEXITCODE -eq 1 -and $out -match 'as Administrator'))) "-DownloadOnly:`$false through -File must parse as false, got: $out"
+$out = & $winPs -NoProfile -NonInteractive -File $installer -DownloadOnly:`$true -Source Local 2>&1 | Out-String
+Assert-True ($LASTEXITCODE -eq 7 -and $out -match 'cannot be combined') "-DownloadOnly:`$true through -File must parse as true, got: $out"
+Remove-Item Function:\Write-Host
 Write-Host 'PASS: scope isolation, argument forwarding, owned cleanup, and revision-preserving relaunch.'

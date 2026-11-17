@@ -6,7 +6,7 @@ Set-StrictMode -Version Latest
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\install.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-$names = @('Install-OnePackage', 'Find-InstalledFramework', 'Get-ProvisionedIdentity', 'Get-PackageIdentity', 'Get-PublisherId', 'Add-Failure', 'Format-ErrorText', 'Find-License', 'Test-InstallResult', 'Format-PackageLabel', 'Format-Brief')
+$names = @('Install-OnePackage', 'Find-InstalledFramework', 'Get-ProvisionedIdentity', 'Get-PackageIdentity', 'Get-PublisherId', 'Add-Failure', 'Format-ErrorText', 'Find-License', 'Test-InstallResult', 'Format-PackageLabel', 'Format-Brief', 'Invoke-Deployment', 'Test-SameOrNewerVersion', 'Test-StoreLicense', 'Read-PackageManifest', 'Copy-LicenseToFolder')
 foreach ($node in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
@@ -23,7 +23,7 @@ function Get-AppxPackage {
     $source = if ($AllUsers) { $script:AllUsersPackages } else { $script:UserPackages }
     @($source | Where-Object Name -eq $Name)
 }
-function Add-AppxProvisionedPackage { param([switch]$Online, $PackagePath, $LicensePath, $Regions, [switch]$SkipLicense) $script:ProvisionCalls++; if ($script:ProvisionError) { throw $script:ProvisionError } }
+function Add-AppxProvisionedPackage { param([switch]$Online, $PackagePath, $LicensePath, $Regions, [switch]$SkipLicense) $script:ProvisionCalls++; $script:LastLicense = $LicensePath; if ($script:ProvisionError) { throw $script:ProvisionError } }
 function Add-AppxPackage { param($Path, [switch]$ForceApplicationShutdown, [switch]$ForceUpdateFromAnyVersion) $script:InstallCalls++ }
 
 function New-Installed($Version, $Arch = 'X64', $Status = 'Ok') { [pscustomobject]@{ Name = 'Microsoft.UI.Xaml.2.8'; Version = $Version; Architecture = $Arch; Publisher = $publisher; Status = $Status } }
@@ -46,6 +46,7 @@ function Reset-State {
     $script:SupersededFrameworks = New-Object System.Collections.Generic.List[string]
     $script:ProvisionedCache = $null; $script:Log.Clear()
     $script:DoProvision = $true; $script:IsSystem = $false; $script:IsOnline = $true; $script:LicenseDirs = @()
+    $script:LiveUi = $false; $script:InstallPosition = ''; $script:Counts = @{ Installed = 0; Present = 0; Failed = 0 }
 }
 
 # 1. Newer framework already provisioned: no older provisioning attempt, no failure.
@@ -106,4 +107,89 @@ Reset-State -Provisioned @('Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8b
 $null = Install-OnePackage -Package $xaml -IsFramework
 Assert ($script:InstallCalls -eq 1) 'An unhealthy registered framework must not suppress registration.'
 
-Write-Host 'PASS: superseded frameworks are skipped or deferred to verification, real failures are counted, and errors log on one line.'
+# 7. Apps follow the same rule: a Store that updated itself is neither rolled back nor reported as a failure.
+function New-App($Name, $Version, $Status = 'Ok') { [pscustomobject]@{ Name = $Name; Version = $Version; Architecture = 'X64'; Publisher = $publisher; Status = $Status } }
+# A unique folder that is never created: Find-License must not pick up license files that happen to exist on the host.
+$fixtureDir = Join-Path ([IO.Path]::GetTempPath()) ('store-fixture-' + [guid]::NewGuid().ToString('N'))
+function New-AppPackage($Name, $Version, $PayloadVersion = $Version) {
+    [pscustomobject]@{
+        File     = [pscustomobject]@{ FullName = (Join-Path $fixtureDir "$Name.msixbundle"); Name = "$Name.msixbundle" }
+        Identity = [pscustomobject]@{ Name = $Name; Version = [version]$Version; PayloadVersion = [version]$PayloadVersion; Arch = 'x64'; Family = "${Name}_8wekyb3d8bbwe"; Publisher = $publisher; Dependencies = @() }
+    }
+}
+$storeApp = New-AppPackage 'Microsoft.WindowsStore' '22609.1401.8.0'
+Reset-State -Provisioned @('Microsoft.WindowsStore_22610.1401.8.0_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.WindowsStore' '22610.1401.8.0') -AllUsers @(New-App 'Microsoft.WindowsStore' '22610.1401.8.0')
+$ok = Install-OnePackage -Package $storeApp
+Assert ($ok -and $script:FailCount -eq 0 -and $script:ProvisionCalls -eq 0 -and $script:InstallCalls -eq 0) 'A newer installed Store must be left alone.'
+Assert ($script:Log -match '^ITEM SKIP .*version 22610\.1401\.8\.0 already installed') 'A newer installed Store must be reported as SKIP with its version.'
+Assert ($script:Counts.Present -eq 1) 'A skipped app counts as already present in the summary.'
+
+# 8. An older installed app is upgraded.
+Reset-State -Provisioned @('Microsoft.WindowsStore_22000.1.1.0_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.WindowsStore' '22000.1.1.0') -AllUsers @(New-App 'Microsoft.WindowsStore' '22000.1.1.0')
+$ok = Install-OnePackage -Package $storeApp
+Assert ($ok -and $script:ProvisionCalls -eq 1 -and $script:InstallCalls -eq 1 -and $script:Counts.Installed -eq 1) 'An older installed Store must be upgraded.'
+
+# 9. A registered bundle app reports its payload version (App Installer 2026.x registers as 1.29.x).
+$wingetApp = New-AppPackage 'Microsoft.DesktopAppInstaller' '2026.917.151.0' '1.29.380.0'
+Reset-State -Provisioned @('Microsoft.DesktopAppInstaller_2026.917.151.0_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.DesktopAppInstaller' '1.29.380.0')
+$ok = Install-OnePackage -Package $wingetApp
+Assert ($ok -and $script:ProvisionCalls -eq 0 -and $script:InstallCalls -eq 0) 'The same App Installer must be recognised by its payload version.'
+
+# 10. Xbox Identity Provider version numbers are not monotonic: legacy 2017.x is replaced by 12.x.
+$xboxApp = New-AppPackage 'Microsoft.XboxIdentityProvider' '12.130.16001.0'
+Reset-State -Provisioned @('Microsoft.XboxIdentityProvider_2017.523.613.1000_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.XboxIdentityProvider' '2017.523.613.1000')
+$ok = Install-OnePackage -Package $xboxApp
+Assert ($ok -and $script:ProvisionCalls -eq 1 -and $script:InstallCalls -eq 1) 'The legacy Xbox Identity Provider must be replaced.'
+
+# 11. Provisioning an app that is rejected because a newer copy is installed is deferred to verification.
+Reset-State -AllUsers @(New-App 'Microsoft.WindowsStore' '22610.1401.8.0') -ProvisionError $deploymentError
+$ok = Install-OnePackage -Package $storeApp
+Assert ($ok -and $script:FailCount -eq 0) 'A provisioning rejection caused by a newer installed app must not count as a failure.'
+
+# 12. App Installer without a license is installed but flagged: winget would report "No applicable app licenses found".
+$wingetPkg = New-AppPackage 'Microsoft.DesktopAppInstaller' '2026.917.151.0' '1.29.380.0'
+Reset-State; $script:IsOnline = $false
+$ok = Install-OnePackage -Package $wingetPkg
+Assert ($ok -and $script:FailCount -eq 1 -and ($script:Log -match '^ITEM WARN .*winget will not run')) 'App Installer without a license must be a WARN line and a partial failure offline.'
+Reset-State
+$ok = Install-OnePackage -Package $wingetPkg
+Assert ($ok -and $script:FailCount -eq 0 -and ($script:Log -match '^ITEM WARN')) 'Online, the failed license download is counted once, not again per package.'
+
+# 13. Licenses are recognised by their content, and a license found later is added to an installed App Installer.
+$licenseDir = Join-Path ([IO.Path]::GetTempPath()) ('store-license-test-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $licenseDir
+try {
+    $family = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
+    $licenseXml = '<License xmlns="urn:schemas-microsoft-com:windows:store:licensing:ls"><Binding Binding_Type="Machine"><PFM>microsoft.desktopappinstaller_8wekyb3d8bbwe</PFM></Binding><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"/></License>'
+    $released = Join-Path $licenseDir 'e53e159d00e04f729cc2180cffd1c02e_License1.xml'
+    Set-Content -LiteralPath $released -Value $licenseXml
+    Set-Content -LiteralPath (Join-Path $licenseDir 'other_License1.xml') -Value $licenseXml.Replace('microsoft.desktopappinstaller', 'microsoft.windowsstore')
+    Set-Content -LiteralPath (Join-Path $licenseDir 'unsigned.xml') -Value $licenseXml.Replace('<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"/>', '')
+    Assert (Test-StoreLicense $released $family) 'A signed license for the family must be accepted, whatever its case.'
+    Assert (-not (Test-StoreLicense (Join-Path $licenseDir 'other_License1.xml') $family)) 'A license for another family must be rejected.'
+    Assert (-not (Test-StoreLicense (Join-Path $licenseDir 'unsigned.xml') $family)) 'An unsigned license must be rejected.'
+
+    $wingetPkg.File = [pscustomobject]@{ FullName = (Join-Path $licenseDir 'winget.msixbundle'); Name = 'winget.msixbundle' }
+    Reset-State -Provisioned @('Microsoft.DesktopAppInstaller_2026.917.151.0_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.DesktopAppInstaller' '1.29.380.0') -AllUsers @(New-App 'Microsoft.DesktopAppInstaller' '1.29.380.0')
+    $ok = Install-OnePackage -Package $wingetPkg
+    Assert ($ok -and $script:ProvisionCalls -eq 1 -and $script:InstallCalls -eq 0 -and $script:LastLicense -eq $released) 'An installed App Installer must be provisioned again with the license found by its content.'
+    Assert ($script:Log -match '^ITEM OK .*license added') 'The result line must say the license was added.'
+
+    # A rejected license is a failure even though the app itself is installed: winget still would not run.
+    Reset-State -Provisioned @('Microsoft.DesktopAppInstaller_2026.917.151.0_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.DesktopAppInstaller' '1.29.380.0') -AllUsers @(New-App 'Microsoft.DesktopAppInstaller' '1.29.380.0') -ProvisionError 'The license is not valid.'
+    $ok = Install-OnePackage -Package $wingetPkg
+    Assert ((-not $ok) -and $script:FailCount -eq 1 -and ($script:Log -match '^ITEM FAIL')) 'A failed license repair must not be reported as success.'
+
+    Reset-State -Provisioned @('Microsoft.DesktopAppInstaller_2027.1.1.0_neutral_~_8wekyb3d8bbwe') -User @(New-App 'Microsoft.DesktopAppInstaller' '1.30.0.0')
+    $null = Install-OnePackage -Package $wingetPkg
+    Assert ($script:ProvisionCalls -eq 0) 'A newer installed App Installer must not be replaced to add a license.'
+
+    # A license found beside the script is copied into the package folder, so a download-only folder is complete.
+    $packages = Join-Path $licenseDir 'packages'
+    $null = New-Item -ItemType Directory -Path $packages
+    $copied = Copy-LicenseToFolder -Path $released -Destination $packages -Family $family
+    Assert ($copied -eq (Join-Path $packages "$family.xml") -and (Test-StoreLicense $copied $family)) 'A license from another folder must be copied into the package folder.'
+    Assert ((Copy-LicenseToFolder -Path $released -Destination $licenseDir -Family $family) -eq $released) 'A license already in the package folder is used where it is.'
+} finally { Remove-Item -LiteralPath $licenseDir -Recurse -Force }
+
+Write-Host 'PASS: superseded frameworks and newer installed apps are skipped or deferred to verification, older apps are upgraded, real failures are counted, errors log on one line, and App Installer gets its license.'

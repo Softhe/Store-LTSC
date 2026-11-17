@@ -86,7 +86,11 @@ try {
     $null = New-TestPackage Unused.Framework x64 1.0.0.0 '' 'CN=Microsoft Corporation' -Framework
     $code = Invoke-Flow
     if ($code -ne 0 -or $global:ReviewInstallCalls -ne 5) { throw "Undeclared framework must be skipped, got $code / $global:ReviewInstallCalls" }
-    Write-Host 'PASS: actual installer orchestration resolves relative folders, reports partial sets, selects usable apps, skips optional apps with missing dependencies, rejects missing Store dependencies before installation, and skips undeclared frameworks.'
+    # Only the Store set is installed: an unrelated package sharing the folder is ignored.
+    $null = New-TestPackage Contoso.Unrelated
+    $code = Invoke-Flow
+    if ($code -ne 0 -or $global:ReviewInstallCalls -ne 5) { throw "Unrelated package must be ignored, got $code / $global:ReviewInstallCalls" }
+    Write-Host 'PASS: actual installer orchestration resolves relative folders, reports partial sets, selects usable apps, skips optional apps with missing dependencies, rejects missing Store dependencies before installation, skips undeclared frameworks, and ignores unrelated packages.'
 } finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     if ($resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase) -and (Split-Path $resolved -Leaf) -like 'store-flow-test-*') { Remove-Item -LiteralPath $resolved -Recurse -Force }
