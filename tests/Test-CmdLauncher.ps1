@@ -23,5 +23,28 @@ try {
     Assert-True ((Get-SourceDefault '-SkipWinget -source:Local') -eq '[]') 'An explicit -Source:value must replace the default.'
     Assert-True ((Get-SourceDefault '-WorkDir "D:\Store Pkgs" -Source Local') -eq '[]') 'An explicit -Source after a quoted path must replace the default.'
     Write-Host 'PASS: launcher applies -Source Auto unless -Source is given as an option.'
+
+    # The UAC relaunch: build the launcher's own command line (without -Verb RunAs) and run its own argument
+    # handling. The elevated copy must return to the starting folder and receive the options unchanged.
+    $first = [array]::IndexOf($launcher, 'set "_args=%*"'); $last = [array]::IndexOf($launcher, ':args_ready')
+    Assert-True ($first -ge 0 -and $last -gt $first) 'Launcher argument handling not found.'
+    $self = Join-Path $temp 'self.cmd'
+    [IO.File]::WriteAllText($self, ((@('@setlocal DisableDelayedExpansion', '@echo off', 'set "_pause="') + $launcher[$first..$last] + @('>"%~dp0seen.txt" echo %CD%^|%_args%^|%_pause%')) -join "`r`n") + "`r`n")
+    $relaunch = @($launcher | Where-Object { $_ -match 'Start-Process -FilePath' })
+    Assert-True ($relaunch.Count -eq 1 -and $relaunch[0] -match '-ArgumentList (\(.+?\)) -Verb RunAs') 'Launcher UAC relaunch line not found.'
+    $expression = $Matches[1] -replace '\\"', '"'
+    $work = Join-Path $temp 'work dir 50%off'
+    $null = New-Item -ItemType Directory -Path $work
+    function Get-ElevatedView([string] $Arguments) {
+        $env:_self = $self; $env:_args = $Arguments
+        Push-Location -LiteralPath $work
+        try { $null = Start-Process -FilePath $env:ComSpec -ArgumentList (Invoke-Expression $expression) -NoNewWindow -Wait -PassThru }
+        finally { Pop-Location; $env:_self = $null; $env:_args = $null }
+        (Get-Content -LiteralPath (Join-Path $temp 'seen.txt') -Raw).Trim()
+    }
+    Assert-True ((Get-ElevatedView '') -eq "$work||1") 'The elevated copy must start in the original folder with no options.'
+    Assert-True ((Get-ElevatedView '-SkipWinget -WorkDir ".\my pkgs"') -eq "$work|-SkipWinget -WorkDir `".\my pkgs`"|1") 'The elevated copy must receive quoted options unchanged.'
+    Assert-True ((Get-ElevatedView '-WorkDir "D:\50%off"') -eq "$work|-WorkDir `"D:\50%off`"|1") 'A percent sign in an option must survive the relaunch.'
+    Write-Host 'PASS: the elevated launcher copy keeps the starting folder and its options.'
 }
 finally { Remove-Item -LiteralPath $temp -Recurse -Force }

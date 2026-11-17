@@ -4,7 +4,7 @@ $source = Join-Path $PSScriptRoot '..\install.ps1'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-$names = @('Get-PackageIdentity', 'Get-PublisherId', 'Read-PackageManifest', 'Get-PackageMetadata', 'Get-ArchRank', 'Get-PackageDependencyState', 'Format-MissingDependency', 'Get-DependencyInstallOrder', 'Select-NewerPackage')
+$names = @('Get-PackageIdentity', 'Get-PublisherId', 'Read-PackageManifest', 'Get-PackageMetadata', 'Test-TargetDeviceFamily', 'Get-ProvisionedIdentity', 'Get-ArchRank', 'Get-PackageDependencyState', 'Format-MissingDependency', 'Get-DependencyInstallOrder', 'Select-NewerPackage')
 foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { Invoke-Expression $node.Extent.Text }
 }
@@ -28,7 +28,7 @@ function New-Fixture {
     return [pscustomobject]@{ File = Get-Item $path; Identity = Get-PackageMetadata $path 'x64' 26100; Rank = Get-ArchRank $Arch 'x64' 26100 }
 }
 try {
-    $script:ProvisionedFixtures = @()
+    $script:ProvisionedFixtures = @(); $script:ProvisionedCache = $null
     $script:DoProvision = $false
     Assert ((Get-PublisherId 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US') -eq '8wekyb3d8bbwe') 'Publisher ID must match the known Microsoft publisher.'
     $native = New-Fixture 'Microsoft.WindowsStore' 'x64'
@@ -63,7 +63,7 @@ try {
     Assert (-not $olderRevisionMetadata.Supported) 'An older update revision must not satisfy the minimum version.'
     $script:DoProvision = $true
     $publisherId = Get-PublisherId 'CN=Test'
-    $script:ProvisionedFixtures = @([pscustomobject]@{ PackageName = "Test.Top_1.0.0.0_x64__$publisherId" })
+    $script:ProvisionedFixtures = @([pscustomobject]@{ PackageName = "Test.Top_1.0.0.0_x64__$publisherId" }); $script:ProvisionedCache = $null
     $provisionedOrder = @(Get-DependencyInstallOrder @() @($app))
     Assert ($provisionedOrder.Count -eq 0) 'Provisioned framework must satisfy dependencies without per-user registration.'
     $script:DoProvision = $false
@@ -79,6 +79,20 @@ try {
     } finally { $archive.Dispose() }
     $bundle = Get-PackageMetadata $bundlePath 'x64' 26100
     Assert ($bundle.Arch -eq 'x64' -and $bundle.Name -eq 'Microsoft.WindowsStore') 'Bundle must select compatible native payload.'
-    Write-Output 'Package selection tests passed.'
+    # App Installer bundles list a stub payload per architecture, with a backslash path, before the real one.
+    $stubBundle = Join-Path $temp 'stub.msixbundle'
+    $archive = [IO.Compression.ZipFile]::Open($stubBundle, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $writer = New-Object IO.StreamWriter($archive.CreateEntry('AppxMetadata/AppxBundleManifest.xml').Open())
+        try { $writer.Write('<Bundle xmlns:b5="urn:test"><Identity Name="Microsoft.DesktopAppInstaller" Version="2026.1.1.0" Publisher="CN=Test"/><Packages><b5:Package Type="application" Version="1.0.0.0" Architecture="x64" FileName="AppxMetadata\Stub\stub.appx" IsStub="true"/><Package Type="application" Version="1.5.0.0" Architecture="x64" FileName="Payload\native.appx"><Dependencies><TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0"/></Dependencies></Package></Packages></Bundle>') } finally { $writer.Dispose() }
+        $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $native.File.FullName, 'Payload/native.appx')
+    } finally { $archive.Dispose() }
+    $stubbed = Get-PackageMetadata $stubBundle 'x64' 19044
+    Assert ($stubbed.Arch -eq 'x64' -and $stubbed.Supported) 'A bundle must use its real payload, not the stub listed first.'
+    Assert ($stubbed.Version -eq [version]'2026.1.1.0' -and $stubbed.PayloadVersion -eq [version]'1.5.0.0') 'A bundle must report both its own and its payload version.'
+    # A neutral package needs frameworks of the machine's architecture.
+    $neutralApp = New-Fixture 'Test.Neutral' 'neutral' -Dependencies '<PackageDependency Name="Test.Base" Publisher="CN=Test" MinVersion="1.0.0.0"/>'
+    Assert ($neutralApp.Identity.Dependencies[0].Arch -eq 'x64') 'A neutral package must depend on native-architecture frameworks.'
+    Write-Host 'PASS: package identity, architecture and Windows-version selection, dependency order, and bundle payloads.'
 }
 finally { Remove-Item -LiteralPath $temp -Recurse -Force }

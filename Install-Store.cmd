@@ -13,10 +13,11 @@ set "_args=%*"
 set "_pause="
 
 rem "__elevated" marks the copy started through UAC below: strip it and pause at the end so the window stays readable.
-if "%~1"=="__elevated" (
-  set "_pause=1"
-  call set "_args=%%_args:~11%%"
-)
+rem No "call set" here: it would expand the arguments a second time and drop any percent sign in a path.
+if not "%~1"=="__elevated" goto :args_ready
+set "_pause=1"
+set "_args=%_args:~11%"
+:args_ready
 
 if not exist "%_ps1%" (
   echo ERROR: Missing "%_ps1%"
@@ -26,14 +27,17 @@ if not exist "%_ps1%" (
 
 whoami /groups 2>nul | findstr /i /c:"S-1-16-16384" /c:"S-1-16-12288" 1>nul
 if not errorlevel 1 goto :elevated
+rem -DownloadOnly installs nothing, so it needs neither administrator rights nor a supported build.
+echo( %* _| findstr /i /r /c:" -DownloadOnly[ :]" 1>nul && goto :run
 if defined _pause (
   echo ERROR: Run this script as Administrator.
   pause
   exit /b 1
 )
 rem Not elevated: ask for admin rights via UAC (one-click use). Fails cleanly where no UAC prompt is possible.
+rem The elevated copy starts in System32, so it first returns to this folder: relative paths in the options keep working.
 echo Requesting administrator rights...
-"%_psexe%" -NoLogo -NoProfile -NonInteractive -Command "try { $p = Start-Process -FilePath $env:ComSpec -ArgumentList ('/c \"\"' + $env:_self + '\" __elevated ' + $env:_args + '\"') -Verb RunAs -Wait -PassThru; exit $p.ExitCode } catch { Write-Host 'ERROR: Run this script as Administrator (elevation was cancelled or is unavailable).'; exit 1 }"
+"%_psexe%" -NoLogo -NoProfile -NonInteractive -Command "try { $p = Start-Process -FilePath $env:ComSpec -ArgumentList ('/c \"cd /d \"' + (Get-Location).Path + '\" ' + [char]38 + ' \"' + $env:_self + '\" __elevated ' + $env:_args + '\"') -Verb RunAs -Wait -PassThru; exit $p.ExitCode } catch { Write-Host 'ERROR: Run this script as Administrator (elevation was cancelled or is unavailable).'; exit 1 }"
 exit /b %ERRORLEVEL%
 
 :elevated
@@ -50,6 +54,7 @@ if %_build% lss 19041 (
   exit /b 2
 )
 
+:run
 rem Packages: local ones next to this script if present (-Source Auto), otherwise downloaded from Microsoft.
 rem Options (-Source, -WorkDir, -DownloadDir, -DownloadOnly, -NoProvision, -SkipWinget, ...) pass through.
 rem Match -Source only as a whole option (" -Source " or " -Source:"), not inside a path such as D:\my-source.

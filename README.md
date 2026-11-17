@@ -16,7 +16,7 @@ Open PowerShell and run:
 irm https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1 | iex
 ```
 
-Accept the UAC prompt if PowerShell is not already running as administrator. After installation, open Microsoft Store from the Start menu. Reboot first if this is a fresh LTSC or IoT Enterprise installation.
+Accept the UAC prompt if PowerShell is not already running as administrator. After installation, open Microsoft Store from the Start menu. If it does not start, restart Windows and try again.
 
 To read the script before running it, download [install.ps1](install.ps1) and [Install-Store.cmd](Install-Store.cmd) into the same folder. Review the PowerShell script, then double-click `Install-Store.cmd`.
 
@@ -26,9 +26,9 @@ To read the script before running it, download [install.ps1](install.ps1) and [I
 - An x64, ARM64, or x86 system.
 - Windows PowerShell 5.1 with FullLanguage mode. The script relaunches in Windows PowerShell if you start it in PowerShell 7, or in a 32-bit process on 64-bit Windows.
 - Administrator rights to install packages. Download-only mode does not require elevation.
-- For online downloads, access to `displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`, and `*.dl.delivery.mp.microsoft.com`. The command above also needs access to `raw.githubusercontent.com`.
+- For online downloads, access to `displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`, and `*.dl.delivery.mp.microsoft.com`. The command above also needs access to `raw.githubusercontent.com`. The App Installer license comes from `api.github.com` and `github.com`.
 
-The minimum build check does not guarantee that every current Store package or app supports every Windows version.
+Microsoft's service offers the same packages to every Windows build, so the script reads the minimum Windows version each app declares. When the newest version of an app does not support the machine, the script falls back to the next version on offer. As of 2026-11-17, the current Microsoft Store, Store Purchase App, Xbox Identity Provider, and App Installer packages all declare support for LTSC 2021 (build 19044).
 
 ## Options
 
@@ -73,25 +73,27 @@ You can also run the saved script from an elevated Windows PowerShell window:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\StorePkgs\install.ps1 -Source Local -WorkDir D:\StorePkgs
 ```
 
-If you have license XML files, put them beside the packages and name them `<PackageFamilyName>.xml`. For example, use `Microsoft.WindowsStore_8wekyb3d8bbwe.xml` for the Store. Without a matching license file, the script provisions packages with `-SkipLicense`.
+If you have license XML files, put them beside the packages and name them `<PackageFamilyName>.xml`. For example, use `Microsoft.WindowsStore_8wekyb3d8bbwe.xml` for the Store. The script also recognises a license by its content, such as the `*_License1.xml` file from a winget release. Without a matching license file, the script provisions packages with `-SkipLicense`.
+
+App Installer is the exception: winget only runs when App Installer was provisioned with its license. Otherwise it fails with `No applicable app licenses found`. Microsofts Store delivery service does not provide this license, so online runs download it from the latest [winget-cli release](https://github.com/microsoft/winget-cli/releases/latest), and download-only runs save it in the download folder as `Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.xml`. Windows checks the license signature when it provisions the package. If the license is unavailable, App Installer is still installed, the run reports a partial failure, and winget does not run. Running the script again with the license present adds it to an installed App Installer of the same version.
 
 ## What the script does
 
 In online mode, the script looks up the apps in Microsoft's Store catalog and requests package metadata from the Store delivery service. It selects app packages by the service's package rank, then version and architecture. It downloads the selected apps first, reads the dependencies declared in their manifests, and downloads only those frameworks, using the newest offered version for each architecture. Frameworks for older app versions or unused architectures are not downloaded. Local folders follow the same rule: frameworks that no app declares are skipped. Apps you later install from Microsoft Store bring their own dependencies.
 
-For each download, the script checks the file size and the hash supplied by Microsoft over HTTPS. It uses SHA-256 when available and falls back to SHA-1. It also requires a valid Microsoft Corporation code signature before replacing the destination file. Failed attempts remove their temporary files, and the script retries before reporting a failure.
+For each download, the script checks the file size and the hash supplied by Microsoft over HTTPS. It uses SHA-256 when available and falls back to SHA-1. It also requires a valid Microsoft Corporation code signature before replacing the destination file. A transfer stops when no data arrives for 60 seconds or when it exceeds `-DownloadTimeoutSeconds`. The script retries, resuming the partial file, before reporting a failure. A file that fails verification is discarded and downloaded again from the start.
 
-For local packages, the script reads identities and dependencies from package manifests. It filters unsupported architectures and Windows versions before selecting apps. Missing Microsoft Store dependencies and framework dependency cycles stop the run before installation. A companion app with missing dependencies is skipped and reported as a partial failure.
+For local packages, the script reads identities and dependencies from package manifests. It filters unsupported architectures and Windows versions before selecting apps. Missing Microsoft Store dependencies and framework dependency cycles stop the run before installation. A companion app with missing dependencies is skipped and reported as a partial failure. Only the Store set is installed: other packages in the folder are listed as skipped and left alone.
 
 The script installs frameworks in dependency order, followed by Microsoft Store and the companion apps. By default, it provisions packages in the Windows image and registers them for the current user. `-NoProvision` skips provisioning. Missing requested companion apps produce a partial-failure result, including in download-only mode.
 
-Windows cannot deploy an older copy of a framework that is already present. When the same framework is already provisioned or registered at the same or a newer version, the script skips that step. If provisioning rejects an older framework because a newer one is installed, the script logs a warning and defers the decision to verification.
+Windows cannot deploy an older copy of a package that is already present, and a Store that has updated itself should not be rolled back by an older download or offline folder. When the same framework or app is already provisioned or registered at the same or a newer version, the script skips that step and reports the package as already installed. If provisioning rejects an older package because a newer one is installed, the script logs a warning and defers the decision to verification. Running the script again on a working installation is therefore safe.
 
 After installation, the script asks Windows for the result. It confirms that each installed app is registered for the current user with status `Ok`. When provisioning, it also confirms that each app is provisioned and that every dependency is provisioned at the required version for new users. Anything not confirmed is a partial failure, and the final summary lists every failure by name.
 
 When run as SYSTEM, such as through Intune, SCCM, or MDT, the script only provisions packages. Windows registers them for users at sign-in. Do not combine SYSTEM execution with `-NoProvision`.
 
-Each run uses a separate temporary download folder. The script verifies ownership before deleting that folder when installation finishes. `-KeepDownloads`, download-only mode, and a custom `-DownloadDir` keep the packages.
+Each run uses a separate temporary download folder. The script verifies ownership before deleting that folder when installation finishes, and also when the run is interrupted with Ctrl+C. `-KeepDownloads`, download-only mode, and a custom `-DownloadDir` keep the packages.
 
 If the script needs to relaunch, it runs a snapshot of the same executing revision and preserves the supplied options.
 
@@ -99,7 +101,9 @@ The online downloader relies on an undocumented Microsoft service. Changes to th
 
 ## Logs and troubleshooting
 
-The console shows a short summary of the run: one line per package with its status (`OK`, `SKIP`, `WARN`, or `FAIL`), the verification results, and the outcome with its exit code. Problems are listed again at the end. The log file keeps every step with timestamps, including package file names and complete error messages.
+The console shows a short summary of the run: one line per package with its status (`OK`, `SKIP`, `WARN`, or `FAIL`), the verification results, and the outcome with the number of packages installed, the elapsed time, and the exit code. Problems are listed again at the end.
+
+In a console window, the step in progress is drawn on a single line that updates in place: a download shows a progress bar, the amount transferred, the speed, and the time left, and an installation step shows its elapsed time. When output is redirected, as in CI, MDT, or a log file, only the permanent lines are written. Run the script with `-Help` to list the options. The log file keeps every step with timestamps, including package file names and complete error messages.
 
 The script prints its log path when installation starts and again at the end. Saved copies normally write logs to `Logs` inside the working folder. When run through the online command, or if that folder is not writable, logs go to `%TEMP%\StoreInstall-Logs`.
 
@@ -118,7 +122,7 @@ For download failures, check access to the Microsoft domains listed in the requi
 | 4 | A required package or dependency is missing, incompatible, or invalid. |
 | 5 | A requested app is unavailable, an installation or provisioning step failed after the Store step succeeded, or verification could not confirm a companion app or a new-user dependency. Download-only sets can also be incomplete. |
 | 6 | The Store installation or provisioning step failed, or the Store is not registered for the current user afterwards. |
-| 7 | A fatal error or invalid configuration stopped the run. |
+| 7 | A fatal error, an unknown option, or an invalid configuration stopped the run. |
 | 8 | Package lookup, download, or verification failed. |
 
 When run through `irm | iex`, the script returns the result in `$LASTEXITCODE` and leaves the PowerShell window open. Early checks, such as a rejected language mode or Windows build, can stop the script before it creates a log.

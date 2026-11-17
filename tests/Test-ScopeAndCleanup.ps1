@@ -31,11 +31,12 @@ $safeSource = $installerText.Remove($moduleCommand.Extent.StartOffset, $moduleCo
 }
 
 # Load the actual functions without running the installer.
-foreach ($name in @('Complete-Run', 'Invoke-Relaunch', 'Clear-Progress')) {
+foreach ($name in @('Complete-Run', 'Invoke-Relaunch', 'Get-WindowsPowerShellModulePath', 'Remove-OwnedDownloadDir', 'Restore-Network', 'Restore-Console', 'Clear-LiveLine', 'Format-Duration')) {
     $definition = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object Name -eq $name | Select-Object -First 1
     Invoke-Expression $definition.Extent.Text
 }
 function Write-Log { param($Message, $Level) }
+function Write-Host { }   # the summary Complete-Run prints is not under test here
 $script:CleanupToken = [guid]::NewGuid().ToString('N')
 $script:CleanupDir = Join-Path ([IO.Path]::GetTempPath()) ('StoreInstall-Packages-' + $script:CleanupToken)
 $null = New-Item -ItemType Directory -Path $script:CleanupDir
@@ -56,7 +57,9 @@ $script:BoundParams = @{ Source = 'Local'; WorkDir = 'C:\offline packages' }
 $WorkDir = $script:BoundParams.WorkDir
 # Mock only process creation. Capture and inspect the real snapshot before its cleanup.
 function Start-Process {
-    param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru)
+    param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru, [switch]$NoNewWindow)
+    # Only the UAC launch is mocked; the same-console relaunch starts the real child process.
+    if (-not $Verb) { return (Microsoft.PowerShell.Management\Start-Process @PSBoundParameters) }
     $bootstrap = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($ArgumentList -split ' ')[-1]))
     Assert-True ($bootstrap -match "& '([^']+install\.ps1)' @parameters") 'Missing relaunch script path.'
     $snapshotPath = $Matches[1]
@@ -87,4 +90,5 @@ $script:BoundParams = @{ Source = 'Local'; DownloadOnly = $true; WorkDir = ''; S
 $WorkDir = ''
 $result = Invoke-Relaunch
 Assert-True ($result -eq 7) 'Real child relaunch lost serialized parameters or its exit code.'
+Remove-Item Function:\Write-Host
 Write-Host 'PASS: scope isolation, argument forwarding, owned cleanup, and revision-preserving relaunch.'
