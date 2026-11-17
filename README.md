@@ -20,7 +20,7 @@ To read the script before you run it, download [install.ps1](install.ps1) and [I
 
 ### Running it again
 
-You can run the command again at any time, for example to repair an installation. The script skips every package that is already installed at the same or a newer version, and it never replaces a newer Store or framework with an older one. When the installed App Installer is the same version as the downloaded one, the script provisions it again with its winget license, so winget works even if an earlier run could not get the license. A newer installed App Installer is left alone, and the script does not add the license to it. An online run downloads the packages again before it compares versions.
+You can run the command again at any time, for example to repair an installation. The script skips every package that is already installed at the same or a newer version, and it never replaces a newer Store or framework with an older one. When the installed App Installer is the same version as the downloaded one, the script provisions it again with its winget license, so winget works even if an earlier run could not get the license. The script leaves a newer installed App Installer alone and does not add the license to it. An online run downloads the packages again before it compares versions.
 
 ## Verified systems
 
