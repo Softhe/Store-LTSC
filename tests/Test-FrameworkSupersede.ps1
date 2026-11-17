@@ -109,9 +109,11 @@ Assert ($script:InstallCalls -eq 1) 'An unhealthy registered framework must not 
 
 # 7. Apps follow the same rule: a Store that updated itself is neither rolled back nor reported as a failure.
 function New-App($Name, $Version, $Status = 'Ok') { [pscustomobject]@{ Name = $Name; Version = $Version; Architecture = 'X64'; Publisher = $publisher; Status = $Status } }
+# A unique folder that is never created: Find-License must not pick up license files that happen to exist on the host.
+$fixtureDir = Join-Path ([IO.Path]::GetTempPath()) ('store-fixture-' + [guid]::NewGuid().ToString('N'))
 function New-AppPackage($Name, $Version, $PayloadVersion = $Version) {
     [pscustomobject]@{
-        File     = [pscustomobject]@{ FullName = "C:\pkgs\$Name.msixbundle"; Name = "$Name.msixbundle" }
+        File     = [pscustomobject]@{ FullName = (Join-Path $fixtureDir "$Name.msixbundle"); Name = "$Name.msixbundle" }
         Identity = [pscustomobject]@{ Name = $Name; Version = [version]$Version; PayloadVersion = [version]$PayloadVersion; Arch = 'x64'; Family = "${Name}_8wekyb3d8bbwe"; Publisher = $publisher; Dependencies = @() }
     }
 }
