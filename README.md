@@ -51,7 +51,7 @@ To pass options when running the script from GitHub, use this form:
 | `-DownloadTimeoutSeconds 1800` | Set the time limit for each package download attempt. The default is 1800 seconds. |
 | `-LogDir D:\StoreLogs` | Write logs to this folder. |
 
-`-WorkDir` defaults to the script's folder when running a saved copy. The command launcher uses `-Source Auto` by default and passes through any options you supply.
+`-WorkDir` defaults to the script's folder when running a saved copy. The command launcher uses `-Source Auto` by default and passes through any options you supply. When it is not already running as administrator, the installer asks for administrator rights (UAC) and continues in a new window that stays open at the end. `-DownloadOnly` needs no administrator rights.
 
 ## Offline installation
 
@@ -103,7 +103,7 @@ The online downloader relies on an undocumented Microsoft service. Changes to th
 
 The console shows a short summary of the run: one line per package with its status (`OK`, `SKIP`, `WARN`, or `FAIL`), the verification results, and the outcome with the number of packages installed, the elapsed time, and the exit code. Problems are listed again at the end.
 
-In a console window, the step in progress is drawn on a single line that updates in place: a download shows a progress bar, the amount transferred, the speed, and the time left, and an installation step shows its elapsed time. When output is redirected, as in CI, MDT, or a log file, only the permanent lines are written. Run the script with `-Help` to list the options. The log file keeps every step with timestamps, including package file names and complete error messages.
+In a console window, the step in progress is drawn on a single line that updates in place: a download shows a progress bar, the amount transferred, the speed, and the time left, and an installation step shows its elapsed time. When output is redirected, as in CI, MDT, a log file, or `*> run.log` in PowerShell, only the permanent lines are written, each as one plain line. Run the script with `-Help` to list the options. The log file keeps every step with timestamps, including package file names and complete error messages.
 
 The script prints its log path when installation starts and again at the end. Saved copies normally write logs to `Logs` inside the working folder. When run through the online command, or if that folder is not writable, logs go to `%TEMP%\StoreInstall-Logs`.
 

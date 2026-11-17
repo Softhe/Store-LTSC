@@ -90,5 +90,14 @@ $script:BoundParams = @{ Source = 'Local'; DownloadOnly = $true; WorkDir = ''; S
 $WorkDir = ''
 $result = Invoke-Relaunch
 Assert-True ($result -eq 7) 'Real child relaunch lost serialized parameters or its exit code.'
+
+# powershell.exe -File (the launcher's call) passes "-Switch:$false" as "-Switch" and the text "$false": it must still parse.
+$installer = Join-Path $PSScriptRoot '..\install.ps1'
+$winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$out = & $winPs -NoProfile -NonInteractive -File $installer -DownloadOnly:`$false -Source Local -WorkDir 'C:\store-ltsc-missing-folder' 2>&1 | Out-String
+# Parsed as false, the run goes on to the elevation check (not elevated: exit 1) or the folder check (exit 7).
+Assert-True ($out -notmatch 'Expected a named parameter' -and (($LASTEXITCODE -eq 7 -and $out -match 'WorkDir not found') -or ($LASTEXITCODE -eq 1 -and $out -match 'as Administrator'))) "-DownloadOnly:`$false through -File must parse as false, got: $out"
+$out = & $winPs -NoProfile -NonInteractive -File $installer -DownloadOnly:`$true -Source Local 2>&1 | Out-String
+Assert-True ($LASTEXITCODE -eq 7 -and $out -match 'cannot be combined') "-DownloadOnly:`$true through -File must parse as true, got: $out"
 Remove-Item Function:\Write-Host
 Write-Host 'PASS: scope isolation, argument forwarding, owned cleanup, and revision-preserving relaunch.'

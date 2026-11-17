@@ -171,6 +171,7 @@ $script:AppTitles = @{
 # Console state. In a real console window the step in progress is drawn on one line that is rewritten in place
 # (spinner, progress bar, speed, elapsed time). Redirected output (CI, MDT, logs) only gets the permanent lines.
 $script:LiveUi = $false
+$script:PlainOutput = $false
 $script:LiveLength = 0
 $script:CursorHidden = $false
 $script:Glyph = @{ Full = '#'; Empty = '-'; Rule = '=' }
@@ -186,8 +187,17 @@ $script:SavedModulePath = $null
 
 function Initialize-Console {
     $script:LiveUi = $false
+    $script:PlainOutput = $false
     try {
+        # Output going to a file or pipe gets plain lines: colours do not survive there anyway.
+        if ([Console]::IsOutputRedirected) { $script:PlainOutput = $true }
         if ($Host.Name -eq 'ConsoleHost' -and [Environment]::UserInteractive -and -not [Console]::IsOutputRedirected -and [Console]::WindowWidth -ge 60) {
+            # "& .\install.ps1 *> run.log" redirects PowerShell's streams, not the process output, so the checks above
+            # still pass while Write-Host goes to the file. Write one space and see whether the cursor moves.
+            $left = [Console]::CursorLeft; $top = [Console]::CursorTop
+            Write-Host ' ' -NoNewline
+            if ([Console]::CursorLeft -eq $left -and [Console]::CursorTop -eq $top) { $script:PlainOutput = $true; return }
+            [Console]::SetCursorPosition($left, $top)
             $script:LiveUi = $true
             # East Asian console code pages draw block characters double-width; keep plain ASCII there.
             if (@(932, 936, 949, 950) -notcontains [Console]::OutputEncoding.CodePage) {
@@ -203,6 +213,17 @@ function Get-ConsoleWidth {
     return 120
 }
 
+function Write-ConsoleText {
+    # Writes straight to the console window. The transient line must never reach PowerShell's output streams, so a
+    # redirected stream or a transcript only ever holds the permanent lines.
+    param([AllowEmptyString()][string] $Text, $Color)
+    if (-not $Text) { return }
+    if (-not $Color) { [Console]::Write($Text); return }
+    $previous = [Console]::ForegroundColor
+    [Console]::ForegroundColor = $Color
+    try { [Console]::Write($Text) } finally { [Console]::ForegroundColor = $previous }
+}
+
 function Write-LiveLine {
     # Rewrites the transient line. Each part is @(text, color); the line is cut to the window width so it never wraps.
     param([Parameter(Mandatory)][object[]] $Parts)
@@ -210,22 +231,22 @@ function Write-LiveLine {
     if (-not $script:CursorHidden) { try { [Console]::CursorVisible = $false; $script:CursorHidden = $true } catch { } }
     $max = (Get-ConsoleWidth) - 1
     $used = 0
-    Write-Host "`r" -NoNewline
+    Write-ConsoleText "`r"
     foreach ($part in $Parts) {
         $text = [string]$part[0]
         if ($used + $text.Length -gt $max) { $text = $text.Substring(0, [Math]::Max(0, $max - $used)) }
         if (-not $text) { continue }
-        if ($part[1]) { Write-Host $text -NoNewline -ForegroundColor $part[1] } else { Write-Host $text -NoNewline }
+        Write-ConsoleText $text $part[1]
         $used += $text.Length
     }
-    if ($used -lt $script:LiveLength) { Write-Host (' ' * ($script:LiveLength - $used)) -NoNewline }
+    if ($used -lt $script:LiveLength) { Write-ConsoleText (' ' * ($script:LiveLength - $used)) }
     $script:LiveLength = $used
 }
 
 function Clear-LiveLine {
     # Erases the transient line so a permanent line can take its place.
     if ($script:LiveLength -gt 0) {
-        Write-Host ("`r" + (' ' * $script:LiveLength) + "`r") -NoNewline
+        Write-ConsoleText ("`r" + (' ' * $script:LiveLength) + "`r")
         $script:LiveLength = 0
     }
 }
@@ -290,21 +311,30 @@ function Split-Line {
     if ($line) { $line }
 }
 
+function Write-Parts {
+    # One permanent line made of @(text, color) parts. When output is redirected, the parts are written as one
+    # plain line: in a redirected stream, each Write-Host -NoNewline would otherwise become a line of its own.
+    param([Parameter(Mandatory)][object[]] $Parts)
+    if ($script:PlainOutput) { Write-Host ((@($Parts) | ForEach-Object { [string]$_[0] }) -join '').TrimEnd(); return }
+    for ($i = 0; $i -lt $Parts.Count; $i++) {
+        $splat = @{ Object = [string]$Parts[$i][0]; NoNewline = ($i -lt $Parts.Count - 1) }
+        if ($Parts[$i][1]) { $splat.ForegroundColor = $Parts[$i][1] }
+        Write-Host @splat
+    }
+}
+
 function Write-StatusLine {
     # Console only: a status column, the text, and an optional dim note. A blank status indents plain text to match.
     param([AllowEmptyString()][string] $Status, [Parameter(Mandatory)][AllowEmptyString()][string] $Text, [string] $Note)
     Clear-LiveLine
-    if ($Status) { Write-Host ('    {0,-6}' -f $Status) -ForegroundColor $script:StatusColors[$Status] -NoNewline }
-    else { Write-Host (' ' * 10) -NoNewline }
-    if ($Note) { Write-Host $Text -NoNewline; Write-Host "  $Note" -ForegroundColor DarkGray; return }
+    $column = if ($Status) { ,@(('    {0,-6}' -f $Status), $script:StatusColors[$Status]) } else { ,@((' ' * 10), $null) }
+    if ($Note) { Write-Parts @($column, @($Text, $null), @("  $Note", 'DarkGray')); return }
     # In a console window, wrap a long message under its own text instead of at the window edge.
     $width = (Get-ConsoleWidth) - 11
-    if (-not $script:LiveUi -or $Text.TrimEnd().Length -le $width) { Write-Host $Text.TrimEnd(); return }
-    $first = $true
+    if (-not $script:LiveUi -or $Text.TrimEnd().Length -le $width) { Write-Parts @($column, @($Text.TrimEnd(), $null)); return }
     foreach ($line in (Split-Line $Text $width)) {
-        if (-not $first) { Write-Host (' ' * 10) -NoNewline }
-        Write-Host $line
-        $first = $false
+        Write-Parts @($column, @($line, $null))
+        $column = @((' ' * 10), $null)
     }
 }
 
@@ -359,8 +389,7 @@ function Write-Section {
     $script:StepNumber++
     Write-Host ''
     if ($script:StepTotal -gt 1) {
-        Write-Host ('  [{0}/{1}] ' -f $script:StepNumber, $script:StepTotal) -ForegroundColor DarkGray -NoNewline
-        Write-Host $Title -ForegroundColor Cyan
+        Write-Parts @(@(('  [{0}/{1}] ' -f $script:StepNumber, $script:StepTotal), 'DarkGray'), @($Title, 'Cyan'))
     }
     else { Write-Host "  $Title" -ForegroundColor Cyan }
 }
@@ -523,7 +552,8 @@ function Invoke-Relaunch {
         $bound['WorkDir'] = $WorkDir
         if ($bound.ContainsKey('LogDir')) { $bound['LogDir'] = $LogDir }
         if ($bound.ContainsKey('DownloadDir')) { $bound['DownloadDir'] = $DownloadDir }
-        if (-not $bound.ContainsKey('LogDir')) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
+        # Without a work folder (irm | iex), the log goes to %TEMP%; a saved copy keeps logging to <WorkDir>\Logs.
+        if (-not $bound.ContainsKey('LogDir') -and -not $WorkDir) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
 
         foreach ($key in @($bound.Keys)) {
             if ($bound[$key] -is [System.Management.Automation.SwitchParameter]) { $bound[$key] = [bool]$bound[$key] }
@@ -544,9 +574,30 @@ function Invoke-Relaunch {
             return $proc.ExitCode
         }
         Write-Host '  Continuing in 64-bit Windows PowerShell...' -ForegroundColor DarkGray
-        # The child shares this console window (not a pipe), so it can draw its progress in place.
-        $proc = Start-Process -FilePath $psExe -ArgumentList ($argList -join ' ') -NoNewWindow -Wait -PassThru
-        return $proc.ExitCode
+        if ($script:LiveUi) {
+            # The child shares this console window (not a pipe), so it can draw its progress in place.
+            $proc = Start-Process -FilePath $psExe -ArgumentList ($argList -join ' ') -NoNewWindow -Wait -PassThru
+            return $proc.ExitCode
+        }
+        # Output is redirected (a file, a pipe, "*> run.log"): pass the child's lines on as host output, which the
+        # caller's redirection captures. A process sharing the console would write past it.
+        # Started through .NET, not "& powershell.exe": for a PowerShell parent, the child repeats its output on stderr
+        # as CLIXML, which PowerShell decodes into a second copy of every line even with 2>$null. Here stdout is read
+        # line by line and stderr is read and dropped.
+        $start = New-Object Diagnostics.ProcessStartInfo $psExe
+        $start.Arguments = $argList -join ' '   # no argument contains a space or quote
+        $start.UseShellExecute = $false
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        try { $start.StandardOutputEncoding = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { }
+        $child = [Diagnostics.Process]::Start($start)
+        try {
+            $null = $child.StandardError.ReadToEndAsync()
+            while ($null -ne ($line = $child.StandardOutput.ReadLine())) { Write-Host $line }
+            $child.WaitForExit()
+            return $child.ExitCode
+        }
+        finally { $child.Dispose() }
     }
     finally {
         $env:PSModulePath = $modulePath
@@ -1846,8 +1897,7 @@ try {
             @('Install', $mode),
             @('Apps', (($families | ForEach-Object { $script:AppTitles[$_ -replace '_.*$'] }) -join ', ')),
             @('Log', $(if ($script:LogFile) { $script:LogFile } else { '(console only)' })))) {
-        Write-Host ('    {0,-10}' -f $field[0]) -ForegroundColor DarkGray -NoNewline
-        Write-Host $field[1]
+        Write-Parts @(@(('    {0,-10}' -f $field[0]), 'DarkGray'), @($field[1], $null))
     }
     # Sections are numbered: get the packages, install frameworks, install apps, verify.
     $script:StepNumber = 0
@@ -2109,7 +2159,7 @@ for ($index = 0; $index -lt $InvocationArguments.Count; $index++) {
     $argument = [string]$InvocationArguments[$index]
     if ($argument -notmatch '^-(?<Name>[a-zA-Z]+)(?::(?<Value>.*))?$') { throw "Expected a named parameter, received '$argument'." }
     $name = $Matches.Name
-    $inlineValue = $Matches.Value
+    $inlineValue = [string]$Matches.Value   # $null when the option has no ":value"
     if ($stringParameters -contains $name) {
         if ($argument.Contains(':') -and $inlineValue -ne '') { $forward[$name] = $inlineValue }
         else {
@@ -2118,10 +2168,17 @@ for ($index = 0; $index -lt $InvocationArguments.Count; $index++) {
         }
     }
     elseif ($switchParameters -contains $name) {
-        if (-not $argument.Contains(':')) { $forward[$name] = $true }
-        elseif ($inlineValue -eq '' -and ($index + 1) -lt $InvocationArguments.Count -and $InvocationArguments[$index + 1] -is [bool]) {
+        if ($inlineValue -eq '' -and ($index + 1) -lt $InvocationArguments.Count -and $InvocationArguments[$index + 1] -is [bool]) {
+            # "-Switch:$false" in a script block call, or through pwsh -File, arrives as "-Switch[:]" and a boolean.
             $forward[$name] = $InvocationArguments[++$index]
         }
+        elseif ($inlineValue -eq '' -and ($index + 1) -lt $InvocationArguments.Count -and [string]$InvocationArguments[$index + 1] -match '^\$(true|false)$') {
+            # powershell.exe -File passes "-Switch:$false" as "-Switch" and the text "$false". Only named options
+            # are accepted, so a "$true"/"$false" right after a switch can only be its value.
+            $index++
+            $forward[$name] = $Matches[1] -eq 'true'
+        }
+        elseif (-not $argument.Contains(':')) { $forward[$name] = $true }
         elseif ($inlineValue -match '^\$?(true|false)$') { $forward[$name] = $Matches[1] -eq 'true' }
         else { throw "Invalid switch value for -$name." }
     }

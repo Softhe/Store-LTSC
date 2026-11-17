@@ -4,19 +4,22 @@ Set-StrictMode -Version Latest
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\install.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-$names = @('Write-Log', 'Write-StatusLine', 'Write-Item', 'Write-LiveLine', 'Clear-LiveLine', 'Restore-Console', 'Show-Activity', 'Get-ConsoleWidth', 'Format-Clock', 'Format-Duration', 'Split-Line', 'Invoke-Deployment')
+$names = @('Write-Log', 'Write-StatusLine', 'Write-Parts', 'Write-Item', 'Write-LiveLine', 'Initialize-Console', 'Clear-LiveLine', 'Restore-Console', 'Show-Activity', 'Get-ConsoleWidth', 'Format-Clock', 'Format-Duration', 'Split-Line', 'Invoke-Deployment')
 foreach ($node in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
 function Assert { param($Condition, $Message) if (-not $Condition) { throw $Message } }
 $script:StatusColors = @{ OK = 'Green'; SKIP = 'DarkCyan'; WARN = 'Yellow'; FAIL = 'Red' }
-$script:LiveUi = $false; $script:LiveLength = 0; $script:CursorHidden = $false
+$script:LiveUi = $false; $script:PlainOutput = $false; $script:LiveLength = 0; $script:CursorHidden = $false
 $script:Glyph = @{ Full = '#'; Empty = '-'; Rule = '=' }
 $script:Spinner = '|', '/', '-', '\'
 $script:RunTimer = [Diagnostics.Stopwatch]::StartNew()
 $script:Shown = New-Object System.Collections.Generic.List[string]
 function Write-Host { param([object]$Object, $ForegroundColor, [switch]$NoNewline) $script:Shown.Add([string]$Object) }
 function Get-ConsoleWidth { 100 }
+# The live line is written straight to the console window; record it apart from Write-Host's permanent lines.
+$script:Drawn = New-Object System.Collections.Generic.List[string]
+function Write-ConsoleText { param([string]$Text, $Color) if ($Text) { $script:Drawn.Add($Text) } }
 
 # 1. Details hidden from the console must not be lost when the log file cannot be written.
 $folder = Join-Path ([IO.Path]::GetTempPath()) ('store-console-test-' + [guid]::NewGuid().ToString('N'))
@@ -52,26 +55,27 @@ try {
 } finally { Remove-Item -LiteralPath $folder -Recurse -Force }
 
 # 2. Redirected output: nothing transient is drawn.
-$script:Shown.Clear()
+$script:Shown.Clear(); $script:Drawn.Clear()
 Show-Activity -Text 'Microsoft Store' -Fraction 0.5 -Detail '60.0 / 120.0 MB'
-Assert ($script:Shown.Count -eq 0) 'Without a console window no progress line may be written.'
+Assert ($script:Shown.Count -eq 0 -and $script:Drawn.Count -eq 0) 'Without a console window no progress line may be written.'
 
 # 3. Console window: the progress line is drawn in place, cut to the window width, and erased before a result line.
 $script:LiveUi = $true
 Show-Activity -Text 'Microsoft Store' -Fraction 0.5 -Detail @('60.0/120.0 MB', '12.0 MB/s', ('x' * 200))
-$drawn = ($script:Shown -join '')
-Assert ($drawn.StartsWith("`r")) 'The progress line must return to the start of the row instead of adding a new one.'
-Assert ($drawn -match 'Microsoft Store' -and $drawn -match '#{5}-{5}' -and $drawn -match ' 50%') 'The progress line must show the name, a half-filled bar and the percentage.'
-Assert (($drawn.Length - 1) -le 99 -and $script:LiveLength -le 99) 'The progress line must never wrap.'
-Assert ($drawn -match '60\.0/120\.0 MB  12\.0 MB/s' -and $drawn -notmatch 'xxx') 'Detail parts that do not fit are left out whole, not cut.'
-$script:Shown.Clear()
+$liveText = ($script:Drawn -join '')
+Assert ($script:Shown.Count -eq 0) 'The progress line must never go through Write-Host, where a redirected stream or a transcript would keep it.'
+Assert ($liveText.StartsWith("`r")) 'The progress line must return to the start of the row instead of adding a new one.'
+Assert ($liveText -match 'Microsoft Store' -and $liveText -match '#{5}-{5}' -and $liveText -match ' 50%') 'The progress line must show the name, a half-filled bar and the percentage.'
+Assert (($liveText.Length - 1) -le 99 -and $script:LiveLength -le 99) 'The progress line must never wrap.'
+Assert ($liveText -match '60\.0/120\.0 MB  12\.0 MB/s' -and $liveText -notmatch 'xxx') 'Detail parts that do not fit are left out whole, not cut.'
+$script:Shown.Clear(); $script:Drawn.Clear()
 Write-StatusLine 'OK' 'Microsoft Store'
-Assert ($script:Shown[0] -match "^`r +`r$" -and $script:LiveLength -eq 0) 'A result line must first erase the progress line.'
+Assert ($script:Drawn[-1] -match "^`r +`r$" -and $script:LiveLength -eq 0 -and $script:Shown[0] -match 'OK') 'A result line must first erase the progress line, then be written as a permanent line.'
 
 # 4. A deployment cmdlet runs on a second runspace while progress is drawn; its result and errors come back.
-$script:Shown.Clear()
+$script:Shown.Clear(); $script:Drawn.Clear()
 Invoke-Deployment -Command 'Start-Sleep' -Parameters @{ Milliseconds = 400 } -Activity 'Microsoft Store' -Detail '1 of 4, adding for new users'
-Assert (@($script:Shown -match 'adding for new users').Count -ge 2) 'A running deployment must keep redrawing its progress line.'
+Assert (@($script:Drawn -match 'adding for new users').Count -ge 2) 'A running deployment must keep redrawing its progress line.'
 $message = ''
 try { Invoke-Deployment -Command 'Get-Item' -Parameters @{ LiteralPath = (Join-Path $folder 'gone') } -Activity 'x' } catch { $message = $_.Exception.Message }
 Assert ($message -match 'gone') "A deployment error must surface as an exception with the cmdlet's message, got '$message'."
@@ -85,4 +89,14 @@ function Add-TestPackage { param($Path) $script:Called = $Path }
 Invoke-Deployment -Command 'Add-TestPackage' -Parameters @{ Path = 'direct' }
 Assert ($script:Called -eq 'direct') 'Without a console window the deployment cmdlet is called directly.'
 
-[Console]::WriteLine('PASS: unsaved log details reach the console, failures wrap, and progress is drawn in place only in a console window.')
+# 5. Redirected output: each status line is one Write-Host call. In a redirected stream every -NoNewline piece
+#    would otherwise become a line of its own.
+$script:Shown.Clear(); $script:PlainOutput = $true
+Write-StatusLine 'OK' 'Microsoft Store' '121.8 MB'
+Write-StatusLine 'WARN' 'Short note'
+Assert ($script:Shown.Count -eq 2 -and $script:Shown[0] -eq '    OK    Microsoft Store  121.8 MB' -and $script:Shown[1] -eq '    WARN  Short note') "Redirected status lines must be whole lines, got: $($script:Shown -join ' | ')"
+$script:Shown.Clear(); $script:PlainOutput = $false
+Write-StatusLine 'OK' 'Microsoft Store' '121.8 MB'
+Assert ($script:Shown.Count -eq 3 -and ($script:Shown -join '') -eq '    OK    Microsoft Store  121.8 MB') 'In a console window the line is written in coloured parts.'
+
+[Console]::WriteLine('PASS: unsaved log details reach the console, failures wrap, progress is drawn in place only in a console window, and redirected lines stay whole.')
