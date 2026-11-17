@@ -918,6 +918,19 @@ function Test-StoreLicense {
     catch { return $false }
 }
 
+function Copy-LicenseToFolder {
+    # Copies a license into a package folder as "<PackageFamilyName>.xml", unless it is already there.
+    # Returns the license path inside the folder.
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Destination, [Parameter(Mandatory)][string] $Family)
+    $target = Join-Path $Destination ($Family + '.xml')
+    $source = [IO.Path]::GetFullPath($Path)
+    if ([string]::Equals($source, [IO.Path]::GetFullPath($target), [StringComparison]::OrdinalIgnoreCase)) { return $target }
+    if ([string]::Equals([IO.Path]::GetDirectoryName($source).TrimEnd('\'), [IO.Path]::GetFullPath($Destination).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { return $source }
+    Copy-Item -LiteralPath $source -Destination $target -Force
+    Write-Log "Copied the license $([IO.Path]::GetFileName($source)) into the package folder as $([IO.Path]::GetFileName($target))" -Quiet
+    return $target
+}
+
 function Save-WingetLicense {
     # App Installer only runs winget when it was provisioned with its license: without one, winget fails with
     # "No applicable app licenses found". The Store delivery service offers no license, but each winget release
@@ -1099,8 +1112,9 @@ function Install-OnePackage {
         catch {
             $msg = Format-ErrorText $_.Exception.Message
             # DISM can reject an older package when a newer one is already installed ("Element not found").
-            # The post-install check decides whether new users still get everything.
-            $newer = @(Find-InstalledFramework -Identity $Package.Identity -Scope AllUsers -App:$isApp)
+            # The post-install check decides whether new users still get everything. That does not apply when the
+            # step was only adding a license: the installed copy is the one still missing it, so this is a failure.
+            $newer = @(if (-not $addLicense) { Find-InstalledFramework -Identity $Package.Identity -Scope AllUsers -App:$isApp })
             if ($newer.Count -gt 0) {
                 Write-Log "Provision not applied: $name :: $msg" 'WARN' -Quiet
                 Write-Log "Version $($newer[0].Version) of this package is already installed on this machine; new-user availability is verified after installation." 'WARN' -Quiet
@@ -1866,11 +1880,13 @@ try {
         }
 
         # winget needs App Installer's license, which the Store service does not hand out (see Save-WingetLicense).
-        # A download-only folder keeps it for the offline install. A license already beside the script is used as is.
+        # A download-only folder keeps it for the offline install. A license already beside the script is used
+        # instead of downloading one, and copied into the package folder so that folder is complete on its own.
         $wingetDownloaded = @($all | Where-Object { $_.Name -like 'Microsoft.DesktopAppInstaller_*' }).Count -gt 0
-        $localWingetLicense = Find-License -PackagePath (Join-Path $pkgDir 'none') -Identity ([pscustomobject]@{ Name = 'Microsoft.DesktopAppInstaller'; Family = $script:WingetFamily })
-        if ($wingetDownloaded -and ($DownloadOnly -or $script:DoProvision) -and -not $localWingetLicense) {
-            $null = Save-WingetLicense -Destination $pkgDir
+        if ($wingetDownloaded -and ($DownloadOnly -or $script:DoProvision)) {
+            $localWingetLicense = Find-License -PackagePath (Join-Path $pkgDir 'none') -Identity ([pscustomobject]@{ Name = 'Microsoft.DesktopAppInstaller'; Family = $script:WingetFamily })
+            if ($localWingetLicense) { $null = Copy-LicenseToFolder -Path $localWingetLicense -Destination $pkgDir -Family $script:WingetFamily }
+            else { $null = Save-WingetLicense -Destination $pkgDir }
         }
         Clear-LiveLine
 
