@@ -6,7 +6,7 @@ Set-StrictMode -Version Latest
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\install.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-$names = @('Install-OnePackage', 'Find-InstalledFramework', 'Get-ProvisionedIdentity', 'Get-PackageIdentity', 'Get-PublisherId', 'Add-Failure', 'Format-ErrorText', 'Find-License', 'Test-InstallResult', 'Format-PackageLabel', 'Format-Brief', 'Invoke-Deployment', 'Test-SameOrNewerVersion', 'Test-StoreLicense', 'Read-PackageManifest', 'Copy-LicenseToFolder')
+$names = @('Install-OnePackage', 'Find-InstalledFramework', 'Get-ProvisionedIdentity', 'Get-PackageIdentity', 'Get-PublisherId', 'Add-Failure', 'Format-ErrorText', 'Find-License', 'Test-InstallResult', 'Format-PackageLabel', 'Format-Brief', 'Invoke-Deployment', 'Test-SameOrNewerVersion', 'Test-StoreLicense', 'Read-PackageManifest', 'Copy-LicenseToFolder', 'Get-DeploymentErrorCode')
 foreach ($node in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
@@ -47,6 +47,7 @@ function Reset-State {
     $script:ProvisionedCache = $null; $script:Log.Clear()
     $script:DoProvision = $true; $script:IsSystem = $false; $script:IsOnline = $true; $script:LicenseDirs = @()
     $script:LiveUi = $false; $script:InstallPosition = ''; $script:Counts = @{ Installed = 0; Present = 0; Failed = 0 }
+    $script:RegistrationGraceSeconds = 0
 }
 
 # 1. Newer framework already provisioned: no older provisioning attempt, no failure.
@@ -86,6 +87,17 @@ $script:FailCount = 0; $script:Failures.Clear(); $script:Log.Clear()
 $script:ProvisionedNames = @('Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8bbwe')
 $null = Test-InstallResult -Applications @($store)
 Assert ($script:FailCount -eq 1 -and -not ($script:Log | Where-Object { $_ -match 'New users: .* provisioned' })) 'An unprovisioned app must not be reported as verified.'
+
+# 2e. A registration Windows is still finishing (2026-11-24 LTSC 2024 VM: App Installer missing for a moment while its
+#     language pack was added) is waited for; one that never appears is still a failure.
+$script:ProvisionedNames = @('Microsoft.WindowsStore_22609.1401.8.0_neutral_~_8wekyb3d8bbwe', 'Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8bbwe')
+$script:UserPackages = @(); $script:Sleeps = 0
+function Start-Sleep { param($Seconds) $script:Sleeps++; if ($script:Sleeps -eq 2) { $script:UserPackages = @([pscustomobject]@{ Name = 'Microsoft.WindowsStore'; Version = '22609.1401.8.0'; Status = 'Ok' }) } }
+$script:FailCount = 0; $script:Failures.Clear(); $script:RegistrationGraceSeconds = 20
+Assert ((Test-InstallResult -Applications @($store)) -and $script:FailCount -eq 0 -and $script:Sleeps -eq 2) 'A registration that appears within the grace period must pass without waiting longer.'
+$script:UserPackages = @(); $script:Sleeps = 100; $script:FailCount = 0; $script:Failures.Clear(); $script:RegistrationGraceSeconds = 3
+Assert (-not (Test-InstallResult -Applications @($store)) -and $script:FailCount -eq 1 -and $script:Sleeps -eq 103) 'A registration that never appears must fail after the grace period.'
+Remove-Item Function:\Start-Sleep; $script:RegistrationGraceSeconds = 0
 
 # 3. A provisioning error without a newer framework remains a failure.
 Reset-State -ProvisionError $deploymentError

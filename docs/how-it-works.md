@@ -1,5 +1,13 @@
 # How it works
 
+## Checking Windows
+
+Before it downloads or installs anything, the script reads the start type of each service the Store depends on from the registry. It reads the registry because Get-Service does not always show protected services such as ClipSVC. A disabled AppX Deployment Service or State Repository Service stops the run with exit code 9, because Windows cannot install apps without them. A disabled Windows Update, Microsoft Store Install Service, Client License Service, Windows License Manager, Delivery Optimization or Web Account Manager does not stop the run, but the Store cannot download, license or sign in without it. The summary lists each of these services again. With `-FixServices`, the script sets each disabled service to Manual through the service manager. The service manager refuses that change to administrators for AppX Deployment Service, Client License Service and Delivery Optimization; only TrustedInstaller may reconfigure AppX Deployment Service. For those services the script writes the registry value instead. Windows reads that value only when it starts, so until the next restart it keeps treating the service as disabled, even though `sc qc` and Get-Service already report Manual. A required service changed this way stops the run with exit code 9 and a request to restart Windows. Because the registry can't show whether that restart has happened, the script also starts AppX Deployment Service and State Repository Service when they are stopped. If Windows refuses with error 1058 (the service is disabled), the run stops the same way.
+
+The script also reports the Group Policies `RemoveWindowsStore` (machine and user), `DisableStoreApps` and `DoNotConnectToWindowsUpdateInternetLocations` when they are set to 1. It never changes policies. On Windows Server it warns that Server is not a tested target. Download-only runs skip these checks.
+
+At the start of an online download, the script compares the PC's clock with the `Date` header of Microsoft's catalog service. When the difference is 5 minutes or more, it asks you to fix the clock, because a wrong clock can break Store sign-in and app licenses. The download itself doesn't depend on the clock: on 2026-11-24 the delivery service served the full package set to a PC whose clock was 20 minutes fast, and to one that was a day fast or a day slow.
+
 ## Choosing and downloading packages
 
 Online, the script looks up each app in Microsoft's Store catalog and asks the Store delivery service for its packages. It ranks app packages by the service's package rank, then by version and architecture. It downloads the chosen apps first and reads the dependencies in their manifests. It then downloads only those frameworks, at the newest offered version for each architecture. Local folders follow the same rule, and the script skips frameworks that no app declares. Apps you install later from Microsoft Store bring their own dependencies.
@@ -24,7 +32,9 @@ When it runs as SYSTEM, for example through Intune, SCCM or MDT, the script only
 
 ## Verifying
 
-After installing, the script asks Windows for the result. It checks that Windows registered each app for the current user with status `Ok`. When provisioning, it also checks that each app and each of its dependencies is provisioned at the required version for new users. Anything the script cannot confirm counts as a partial failure, and the summary lists each failure by name.
+After installing, the script asks Windows for the result. It checks that Windows registered each app for the current user with status `Ok`. Windows can leave out a package it is still servicing, for example while it adds a language pack, so the script waits up to 20 seconds for a missing app before it counts a failure. When App Installer is registered, the script runs `winget --version` through the user's App Execution Alias. Without its license, Windows refuses to start winget even though the package is registered. When provisioning, it also checks that each app and each of its dependencies is provisioned at the required version for new users. Anything the script cannot confirm counts as a partial failure, and the summary lists each failure by name. A missing winget license is counted once, not again when winget then fails to start.
+
+Whether a deployment error is harmless depends on its code: `0x80073D06` (a higher version is installed) and `0x80073CFB` (the same package is installed). The script takes the code from the `HRESULT: 0x...` part of the error, which is the same in every Windows language. The exception's own HResult is often a mapped value, so the script uses it only when the text has no code. It then asks Windows for the version that is installed.
 
 ## Temporary files and restarts
 

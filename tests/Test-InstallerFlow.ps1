@@ -26,6 +26,11 @@ function Install-OnePackage {
 }
 function Get-AppxPackage { param($Name, [switch]$AllUsers, $ErrorAction) if ($global:ReviewRegistered -contains $Name) { [pscustomobject]@{ Name = $Name; Version = '1.0.0.0'; Status = 'Ok' } } }
 function Get-AppxProvisionedPackage { param([switch]$Online, $ErrorAction) }
+function Get-ServiceStartValue { param($Name) 3 }
+function Test-ServiceCanStart { param($Name) $true }
+function Get-PolicyValue { param($Hive, $Key, $Name) }
+function Test-WingetCommand { $true }
+function Start-Sleep { param($Seconds, $Milliseconds) }
 '@
 $bodyText = $body.Extent.Text
 $offset = $mainTry.Extent.StartOffset - $body.Extent.StartOffset

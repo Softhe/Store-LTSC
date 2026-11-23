@@ -86,6 +86,7 @@ try {
     } finally { $server.Stop(); $serverShell.Dispose() }
     Write-Host 'PASS: download reports progress and resumes a partial file.'
     function Initialize-Network { }
+    function Test-Clock { }
     function Get-Fe3DeviceAttributes { param($OsArch, $Build) 'test' }
     function Get-Fe3Cookie { 'test' }
     function Get-WuCategoryId { param($PackageFamilyName) if ($PackageFamilyName -eq 'Winget') { throw 'mock lookup failure' }; 'store-category' }
