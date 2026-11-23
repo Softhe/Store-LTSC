@@ -35,9 +35,13 @@ You can run the command again at any time, for example to repair an installation
 
 Click a screenshot to see it at full size.
 
+### LTSC 2019
+
+The script does not install Microsoft Store on Windows 10 Enterprise LTSC 2019 (build 17763). It stops with exit code 2. A test on 2026-11-23 showed why. With the build check lowered, the script installed Store 12107, the newest version that supports build 17763. The Store opened with a Microsoft message asking to upgrade to a supported Windows version. Its app pages did not load, so it could not install any app.
+
 ## Requirements
 
-- Windows 10 or Windows 11, build 19041 or later. LTSC 2021 and LTSC 2024 qualify. LTSC 2019 and older releases are below the minimum build.
+- Windows 10 or Windows 11, build 19041 or later. LTSC 2021 and LTSC 2024 qualify. LTSC 2019 and older releases are below the minimum build. [LTSC 2019](#ltsc-2019) explains why.
 - An x64, ARM64 or x86 processor.
 - Windows PowerShell 5.1 in FullLanguage mode. If you start the script in PowerShell 7, or in 32-bit PowerShell on 64-bit Windows, it restarts itself in 64-bit Windows PowerShell.
 - Administrator rights to install packages. Download-only mode needs none.
