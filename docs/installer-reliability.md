@@ -16,7 +16,15 @@ Downloads use one unique temporary file per package. A retry resumes that file w
 
 The Store service offers the same packages to every Windows build; it does not filter by the build the script reports. On 2026-11-17 it offered identical lists for builds 17763, 19044, and 26100. The script therefore reads the `TargetDeviceFamily` minimum version from each downloaded app. If the best-ranked version does not support the machine, the script removes it and tries the next version on offer. With no usable Microsoft Store version, the run ends with code 8.
 
-On that date, the current packages declared these minimum builds: Microsoft Store 18362, Store Purchase App 18362, Xbox Identity Provider 16299, and App Installer 17763. All support LTSC 2021 (build 19044). LTSC 2019 (build 17763) is below the current Store's minimum; the service still offers Store 12107, which declares 16299, but the script's own minimum remains build 19041 until that path is tested on a real system.
+On that date, the current packages declared these minimum builds: Microsoft Store 18362, Store Purchase App 18362, Xbox Identity Provider 16299, and App Installer 17763. All support LTSC 2021 (build 19044). LTSC 2019 (build 17763) is below the current Store's minimum. The service still offers Store 12107, which declares 16299.
+
+On 2026-11-23 a test on Windows 10 Enterprise LTSC 2019, build 17763.316, ran the script with its build check lowered to 17763. The script fell back to Store 12107 and installed it, along with Xbox Identity Provider and App Installer. The run still failed in three ways:
+
+- Microsoft no longer serves the Store on that build. Store 12107 opened with a message asking to upgrade to a supported Windows version, and its app pages showed an error saying the browser was too old. Installing a Store app through winget failed with `0x80070005`.
+- Store Purchase App has no version for build 17763. The service offers only one version, and it declares 18362.
+- DISM on build 17763 refuses to provision a framework on its own. Its log says the package "must be passed using the /dependencyPackagePath parameter". The frameworks registered for the current user, but new users would not get them.
+
+winget's community source worked on that build. The script's minimum stays at build 19041.
 
 App Installer bundles list a stub payload for each architecture before the real one, with a backslash in its path. The script ignores stub payloads and reads the real payload for the machine's architecture.
 
