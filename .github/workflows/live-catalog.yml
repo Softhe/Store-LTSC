@@ -36,11 +36,19 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "install.ps1 -DownloadOnly exited with code $code" }
 
+      # Also after a failed download (exit 5 for a missing app or framework), so the summary says what was missing.
+      # The job still fails: the download step's failure stands.
       - name: Check the downloaded set
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'packages'
-          $manifest = Get-Content -LiteralPath (Join-Path $dir 'store-packages.json') -Raw | ConvertFrom-Json
+          $manifestPath = Join-Path $dir 'store-packages.json'
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            "### ${{ matrix.name }}`n`nNo package manifest: the download stopped before writing one. See the installer log artifact." | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            throw 'No store-packages.json was written'
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
           $problems = @()
           if ($manifest.Build -ne ${{ matrix.build }} -or $manifest.OsArch -ne '${{ matrix.arch }}') { $problems += "manifest targets $($manifest.Build) $($manifest.OsArch)" }
           if (@($manifest.MissingFamilies).Count -gt 0) { $problems += "missing apps: $(@($manifest.MissingFamilies) -join ', ')" }

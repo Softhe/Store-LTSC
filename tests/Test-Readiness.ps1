@@ -164,6 +164,10 @@ try {
     $eventText = 'Deployment of C:\Users\carol\AppData\Local\Packages\x failed. C:\Users\Public\Documents and C:\Users\Default\NTUSER.DAT and C:\Program Files\WindowsApps\Microsoft.WindowsStore_1.0.0.0_x64__8wekyb3d8bbwe stay.'
     $text = Protect-DiagnosticText $eventText
     Assert ($text -notmatch 'carol' -and $text -match 'C:\\Users\\Public\\Documents' -and $text -match 'C:\\Users\\Default\\NTUSER' -and $text -match 'WindowsApps\\Microsoft\.WindowsStore_1\.0\.0\.0') "Event text must lose other profiles and keep shared folders and package paths, got: $text"
+    # Shared folder names only count as a whole folder name, and a name with spaces at the end of a path is removed
+    # completely (CodeRabbit review, PR #8).
+    $text = Protect-DiagnosticText "Opened C:\Users\Public Smith\file.appx`r`nWork dir  : C:\Users\Jane Smith`r`nProfile 'C:\Users\Default User' and C:\Users\Public"
+    Assert ($text -notmatch 'Public Smith|Jane|Smith' -and $text -match 'C:\\Users\\<user>\\file\.appx' -and $text -match 'Work dir  : C:\\Users\\<user>\r' -and $text -match "'C:\\Users\\Default User'" -and $text -match 'C:\\Users\\Public$') "Shared-folder look-alikes and names with spaces must be removed whole, got: $text"
 } finally { foreach ($kv in $saved.GetEnumerator()) { Set-Item -Path "Env:$($kv.Key)" -Value $kv.Value } }
 Write-Host 'PASS: diagnostics text is redacted, including other accounts in logs and events.'
 
