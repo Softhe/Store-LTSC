@@ -44,6 +44,8 @@ jobs:
           $problems = @()
           if ($manifest.Build -ne ${{ matrix.build }} -or $manifest.OsArch -ne '${{ matrix.arch }}') { $problems += "manifest targets $($manifest.Build) $($manifest.OsArch)" }
           if (@($manifest.MissingFamilies).Count -gt 0) { $problems += "missing apps: $(@($manifest.MissingFamilies) -join ', ')" }
+          # Frameworks the apps declare but the service did not offer: the folder could not install on a clean PC.
+          if ($manifest.PSObject.Properties['MissingDependencies'] -and @($manifest.MissingDependencies).Count -gt 0) { $problems += "frameworks not offered: $(@($manifest.MissingDependencies) -join ', ')" }
           $files = @($manifest.Files | ForEach-Object Name)
           foreach ($app in 'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.XboxIdentityProvider', 'Microsoft.DesktopAppInstaller') {
             if (-not ($files -like "${app}_*")) { $problems += "no $app package" }

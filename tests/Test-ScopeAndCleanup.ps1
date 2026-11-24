@@ -84,6 +84,15 @@ $script:BoundParams = @{ Source = 'Local' }
 $null = Invoke-Relaunch -Elevate
 Assert-True ($script:CapturedParameters.WorkDir -eq 'C:\resolved\pkgs' -and -not $script:CapturedParameters.ContainsKey('DownloadDir')) 'Relaunch must forward the resolved WorkDir without inventing unbound options.'
 
+# irm | iex has no WorkDir, so the relaunch gives the log a %TEMP% folder. -CollectLogs must not get one: there
+# -LogDir is where the zip goes, and the zip belongs on the desktop unless the user chose a folder.
+$script:BoundParams = @{}; $WorkDir = ''; $LogDir = ''
+$null = Invoke-Relaunch -Elevate
+Assert-True ($script:CapturedParameters.LogDir -like '*StoreInstall-Logs') 'An install relaunched without a WorkDir must log to the temporary folder.'
+$CollectLogs = $true; $script:BoundParams = @{ CollectLogs = $true }
+try { $null = Invoke-Relaunch -Elevate } finally { $CollectLogs = $false }
+Assert-True (-not $script:CapturedParameters.ContainsKey('LogDir') -and $script:CapturedParameters.CollectLogs) '-CollectLogs must be relaunched without a default LogDir, so its zip goes to the desktop.'
+
 # Exercise the native process boundary too. The invalid combination exits before any
 # OS, admin, network, log, or package operation in the real Windows PowerShell child.
 $script:BoundParams = @{ Source = 'Local'; DownloadOnly = $true; WorkDir = ''; SkipWinget = $false; ErrorAction = 'Stop' }

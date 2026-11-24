@@ -595,7 +595,8 @@ function Invoke-Relaunch {
         if ($bound.ContainsKey('LogDir')) { $bound['LogDir'] = $LogDir }
         if ($bound.ContainsKey('DownloadDir')) { $bound['DownloadDir'] = $DownloadDir }
         # Without a work folder (irm | iex), the log goes to %TEMP%; a saved copy keeps logging to <WorkDir>\Logs.
-        if (-not $bound.ContainsKey('LogDir') -and -not $WorkDir) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
+        # Not for -CollectLogs: there -LogDir is where the zip goes, and only the user may choose that over the desktop.
+        if (-not $bound.ContainsKey('LogDir') -and -not $WorkDir -and -not $CollectLogs) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
 
         foreach ($key in @($bound.Keys)) {
             if ($bound[$key] -is [System.Management.Automation.SwitchParameter]) { $bound[$key] = [bool]$bound[$key] }
@@ -1605,7 +1606,10 @@ function Test-WingetCommand {
 
 # region Diagnostics bundle (-CollectLogs)
 function Protect-DiagnosticText {
-    # Removes the user, computer and domain names and account SIDs, so the bundle can go on a public issue.
+    # Removes user, computer and domain names and account SIDs, so the bundle can go on a public issue. The collected
+    # logs and events can come from other accounts too (a shared offline folder, another user's install), so besides
+    # the collecting account's own names it replaces every profile folder name under \Users\ and the account and
+    # computer recorded in an installer log, whoever they belong to.
     param([AllowNull()][AllowEmptyString()][string] $Text)
     if (-not $Text) { return $Text }
     $Text = [regex]::Replace($Text, 'S-1-5-21-\d+-\d+-\d+-\d+', '<sid>')
@@ -1613,6 +1617,14 @@ function Protect-DiagnosticText {
         if (-not $pair[0] -or $pair[0].Length -lt 2) { continue }
         $Text = [regex]::Replace($Text, '(?<![\w-])' + [regex]::Escape($pair[0]) + '(?![\w-])', $pair[1], 'IgnoreCase')
     }
+    # Any other account's profile folder. A name followed by a backslash may contain spaces; one at the end of a path
+    # ends at the first space. Windows' shared profile folders are kept: they name no one.
+    $shared = '(?!(?:Public|Default|Default User|All Users)(?:\\|\s|$))'
+    $Text = [regex]::Replace($Text, '(?<=\\Users\\)' + $shared + '[^\\\r\n"''<>|*?:]+(?=\\)', '<user>', 'IgnoreCase')
+    $Text = [regex]::Replace($Text, '(?<=\\Users\\)' + $shared + '[^\\\s"''<>|*?:]+', '<user>', 'IgnoreCase')
+    # The account and computer an installer log recorded, which may be another user's or another PC's.
+    $Text = [regex]::Replace($Text, '(?m)^(\[[^\]\r\n]*\] \[\w+\] User\s*: )[^\r\n(]*?(\s*\(SYSTEM[^\r\n]*)?(\r?)$', '$1<domain>\<user>$2$3')
+    $Text = [regex]::Replace($Text, '(?m)^(\[[^\]\r\n]*\] \[\w+\] Computer\s*: )[^\r\n]*?(\r?)$', '$1<computer>$2')
     return $Text
 }
 
@@ -1711,32 +1723,41 @@ function Save-Diagnostics {
     }
     Write-Host ''
     Write-Host '  Collecting diagnostics for a bug report' -ForegroundColor Cyan
-    foreach ($part in $parts.GetEnumerator()) {
-        Show-Activity -Text 'Collecting diagnostics' -Detail $part.Key
-        $text = try { (& $part.Value | Out-String -Width 250) } catch { "Unavailable: $(Format-ErrorText $_.Exception.Message)" }
-        if (-not $text.Trim()) { $text = '(nothing found)' }
-        Set-Content -LiteralPath (Join-Path $staging $part.Key) -Value (Protect-DiagnosticText $text) -Encoding UTF8
-        Write-StatusLine 'OK' $part.Key
-    }
-    # The newest installer logs from every place a run writes them.
-    $logDirs = @((Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs'), $LogDir, $(if ($WorkDir) { Join-Path $WorkDir 'Logs' })) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
-    $logs = @($logDirs | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter 'StoreInstall-*.log' -File -ErrorAction SilentlyContinue } | Sort-Object LastWriteTime -Descending | Select-Object -First 5)
-    if ($logs.Count -gt 0) {
-        $null = New-Item -ItemType Directory -Path (Join-Path $staging 'logs')
-        foreach ($log in $logs) { Set-Content -LiteralPath (Join-Path $staging "logs\$($log.Name)") -Value (Protect-DiagnosticText (Get-Content -LiteralPath $log.FullName -Raw)) -Encoding UTF8 }
-    }
-    Write-StatusLine 'OK' "installer logs: $($logs.Count)"
-    Clear-LiveLine
-
-    $desktop = [Environment]::GetFolderPath('Desktop')
-    $outDir = if ($LogDir) { $LogDir } elseif ($desktop -and -not (Test-IsSystemAccount) -and (Test-Path -LiteralPath $desktop -PathType Container)) { $desktop } else { Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
+    # One try/finally around everything that writes to the staging folder, so no failure leaves it behind.
     try {
+        foreach ($part in $parts.GetEnumerator()) {
+            Show-Activity -Text 'Collecting diagnostics' -Detail $part.Key
+            $text = try { (& $part.Value | Out-String -Width 250) } catch { "Unavailable: $(Format-ErrorText $_.Exception.Message)" }
+            if (-not $text.Trim()) { $text = '(nothing found)' }
+            Set-Content -LiteralPath (Join-Path $staging $part.Key) -Value (Protect-DiagnosticText $text) -Encoding UTF8
+            Write-StatusLine 'OK' $part.Key
+        }
+        # The newest installer logs from every place a run writes them. A log that cannot be read (another run still
+        # writing it, no permission) is noted in the bundle instead of stopping the collection.
+        $logDirs = @((Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs'), $LogDir, $(if ($WorkDir) { Join-Path $WorkDir 'Logs' })) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+        $logs = @($logDirs | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter 'StoreInstall-*.log' -File -ErrorAction SilentlyContinue } | Sort-Object LastWriteTime -Descending | Select-Object -First 5)
+        $copied = 0
+        if ($logs.Count -gt 0) {
+            $null = New-Item -ItemType Directory -Path (Join-Path $staging 'logs')
+            foreach ($log in $logs) {
+                try { $text = Get-Content -LiteralPath $log.FullName -Raw -ErrorAction Stop; $copied++ }
+                catch { $text = "Unreadable: $(Format-ErrorText $_.Exception.Message)" }
+                Set-Content -LiteralPath (Join-Path $staging "logs\$($log.Name)") -Value (Protect-DiagnosticText $text) -Encoding UTF8
+            }
+        }
+        Write-StatusLine $(if ($copied -eq $logs.Count) { 'OK' } else { 'WARN' }) "installer logs: $copied$(if ($copied -lt $logs.Count) { " of $($logs.Count) readable" })"
+        Clear-LiveLine
+
+        # -LogDir only when the user gave it: a relaunch does not fill it in for -CollectLogs (Invoke-Relaunch).
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $outDir = if ($LogDir) { $LogDir } elseif ($desktop -and -not (Test-IsSystemAccount) -and (Test-Path -LiteralPath $desktop -PathType Container)) { $desktop } else { Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
         if (-not (Test-Path -LiteralPath $outDir -PathType Container)) { $null = New-Item -ItemType Directory -Path $outDir -Force }
         $zip = Join-Path $outDir "Store-LTSC-diagnostics-$stamp.zip"
         Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
     }
     catch {
-        Write-StatusLine 'FAIL' "Could not write the diagnostics zip: $(Format-ErrorText $_.Exception.Message)"
+        Clear-LiveLine
+        Write-StatusLine 'FAIL' "Could not save the diagnostics: $(Format-ErrorText $_.Exception.Message)"
         return 7
     }
     finally { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
@@ -2140,7 +2161,10 @@ function Save-OnlinePackages {
         [Parameter(Mandatory)][string[]] $Families,
         [Parameter(Mandatory)][string] $OsArch,
         [Parameter(Mandatory)][int] $Build,
-        [int] $Revision = 0
+        [int] $Revision = 0,
+        # Download-only: the folder must hold every framework the apps declare, so one the service does not offer is a
+        # failure. An install can still use a framework the PC already has.
+        [switch] $RequireComplete
     )
     Initialize-Network
     Show-Activity -Text 'Microsoft Store catalog' -Detail 'checking the clock'
@@ -2238,11 +2262,22 @@ function Save-OnlinePackages {
     # The service offers frameworks for every app version. Download only the frameworks the chosen apps'
     # manifests declare (and what those frameworks declare in turn).
     $neededFw = New-Object System.Collections.Generic.List[object]
+    # Declared frameworks the service does not offer (name, minimum version, architecture). Installing can still work
+    # when the PC already has them; an offline folder (-RequireComplete) is incomplete without them.
+    $unsatisfied = [ordered]@{}
     while ($pendingManifests.Count -gt 0) {
         $item = $pendingManifests.Dequeue()
         foreach ($dep in $item.Metadata.Dependencies) {
             $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
             $matching = @($fwPkgs | Where-Object { $_.Identity.Name -eq $dep.Name -and (-not $expectedFamily -or $_.Identity.Family -eq $expectedFamily) -and ($_.Identity.Arch -eq 'neutral' -or $_.Identity.Arch -eq $dep.Arch) -and $_.Identity.Version -ge $dep.MinVersion })
+            if ($matching.Count -eq 0) {
+                $key = '{0} {1} or newer ({2})' -f $dep.Name, $dep.MinVersion, $dep.Arch
+                if (-not $unsatisfied.Contains($key)) {
+                    $unsatisfied[$key] = $true
+                    Write-Log "The service offers no package for $key, which $($item.Package.Identity.Name) declares" 'WARN' -Quiet:(-not $RequireComplete)
+                    if ($RequireComplete) { Add-Failure "Framework not offered: $key" }
+                }
+            }
             foreach ($fw in $matching) {
                 if ($neededFw.Contains($fw)) { continue }
                 $neededFw.Add($fw)
@@ -2266,6 +2301,7 @@ function Save-OnlinePackages {
         Build = $Build
         RequestedFamilies = @($Families)
         MissingFamilies = @($missing)
+        MissingDependencies = @($unsatisfied.Keys)
         Files = @($downloaded | ForEach-Object {
             # The published SHA-256 was just verified against the file; hash again only when the service gave SHA-1.
             $sha256 = if ($hashes[$_.Name]) { [BitConverter]::ToString([Convert]::FromBase64String($hashes[$_.Name])) -replace '-', '' } else { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
@@ -2495,7 +2531,7 @@ try {
 
         Write-Section 'Downloading packages from Microsoft'
         try {
-            $all = @(Save-OnlinePackages -Destination $pkgDir -Families $families -OsArch $pkgArch -Build $pkgBuild -Revision $pkgRevision)
+            $all = @(Save-OnlinePackages -Destination $pkgDir -Families $families -OsArch $pkgArch -Build $pkgBuild -Revision $pkgRevision -RequireComplete:$DownloadOnly)
         }
         catch {
             Clear-LiveLine

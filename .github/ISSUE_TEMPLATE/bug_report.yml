@@ -11,7 +11,7 @@ body:
         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1))) -CollectLogs
         ```
 
-        It installs nothing. It saves `Store-LTSC-diagnostics-<date>.zip` on your desktop with system details, service states, policies, the installed Store packages, recent AppX deployment errors and the last installer logs. User, computer and domain names are replaced with placeholders. Look through the files before you attach the zip.
+        It installs nothing. It saves `Store-LTSC-diagnostics-<date>.zip` and prints its full path at the end. That is usually your desktop. With `-LogDir` it is that folder, and when there is no desktop (for example when run as SYSTEM) it is `%TEMP%\StoreInstall-Logs`. The zip holds system details, service states, policies, the installed Store packages, recent AppX deployment errors and the last installer logs. User, computer and domain names are replaced with placeholders. Look through the files before you attach the zip.
   - type: input
     id: windows
     attributes:

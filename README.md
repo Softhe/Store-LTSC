@@ -227,7 +227,7 @@ Run the installer with `-CollectLogs` on the affected PC:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1))) -CollectLogs
 ```
 
-It installs nothing. It saves `Store-LTSC-diagnostics-<date>.zip` on the desktop with the Windows version, service states, Store policies, the installed and provisioned Store packages, winget's state, AppX deployment errors from the last 7 days, network checks and the last five installer logs. User, computer and domain names and account SIDs are replaced with placeholders. Look through the files, then attach the zip to a [bug report](https://github.com/Softhe/Store-LTSC/issues/new/choose).
+It installs nothing. It saves `Store-LTSC-diagnostics-<date>.zip` with the Windows version, service states, Store policies, the installed and provisioned Store packages, winget's state, AppX deployment errors from the last 7 days, network checks and the last five installer logs. The zip goes on the desktop, or in the `-LogDir` folder if you give one, or in `%TEMP%\StoreInstall-Logs` when there is no desktop, such as when it runs as SYSTEM. The script prints the full path at the end. User, computer and domain names, other accounts' profile folders and account SIDs are replaced with placeholders. Look through the files, then attach the zip to a [bug report](https://github.com/Softhe/Store-LTSC/issues/new/choose).
 
 <details>
 <summary><b>Exit codes</b></summary>

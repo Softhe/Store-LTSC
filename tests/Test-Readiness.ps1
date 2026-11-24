@@ -156,8 +156,59 @@ try {
     $text = Protect-DiagnosticText 'User CONTOSO\Administrator on desk-42, profile C:\Users\Administrator\AppData, SID S-1-5-21-1111-2222-3333-1001, group BUILTIN\Administrators'
     Assert ($text -notmatch 'CONTOSO|DESK-42|S-1-5-21' -and $text -notmatch '\\Administrator\b') "Names must be removed, got: $text"
     Assert ($text -match '%USERPROFILE%\\AppData' -and $text -match 'BUILTIN\\Administrators') "Placeholders must keep the text readable and unrelated words intact, got: $text"
+    # Logs and events can name other accounts and other PCs (a shared offline folder, another user's install).
+    $logText = "[2026-11-24 00:19:49] [INFO] User      : OTHERPC\alice (SYSTEM: provisioning only)`r`n[2026-11-24 00:19:49] [INFO] Computer  : OTHERPC`r`n[2026-11-24 00:19:49] [INFO] Work dir  : C:\Users\John Smith\Downloads\StorePkgs`r`n[2026-11-24 00:19:50] [INFO] Log file  : C:\Users\bob"
+    $text = Protect-DiagnosticText $logText
+    Assert ($text -notmatch 'alice|OTHERPC|John Smith|bob') "Other accounts and computers must be removed from logs, got: $text"
+    Assert ($text -match 'User      : <domain>\\<user> \(SYSTEM: provisioning only\)' -and $text -match 'Computer  : <computer>\r' -and $text -match 'C:\\Users\\<user>\\Downloads\\StorePkgs') "Log lines must keep their shape, got: $text"
+    $eventText = 'Deployment of C:\Users\carol\AppData\Local\Packages\x failed. C:\Users\Public\Documents and C:\Users\Default\NTUSER.DAT and C:\Program Files\WindowsApps\Microsoft.WindowsStore_1.0.0.0_x64__8wekyb3d8bbwe stay.'
+    $text = Protect-DiagnosticText $eventText
+    Assert ($text -notmatch 'carol' -and $text -match 'C:\\Users\\Public\\Documents' -and $text -match 'C:\\Users\\Default\\NTUSER' -and $text -match 'WindowsApps\\Microsoft\.WindowsStore_1\.0\.0\.0') "Event text must lose other profiles and keep shared folders and package paths, got: $text"
 } finally { foreach ($kv in $saved.GetEnumerator()) { Set-Item -Path "Env:$($kv.Key)" -Value $kv.Value } }
-Write-Host 'PASS: diagnostics text is redacted.'
+Write-Host 'PASS: diagnostics text is redacted, including other accounts in logs and events.'
+
+# 5b. Collecting: an unreadable log is noted, not fatal, and the staging folder never stays behind.
+foreach ($node in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Save-Diagnostics' }, $true)) { . ([scriptblock]::Create($node.Extent.Text)) }
+function Get-ClockOffset { }
+function Test-Endpoint { param($Uri) 'reachable' }
+function Get-OsArch { 'x64' }
+function Test-IsElevated { $false }
+function Test-IsSystemAccount { $false }
+function Get-AppxPackage { param($Name, [switch]$AllUsers, $ErrorAction) }
+function Invoke-Winget { param($Arguments, $TimeoutSeconds) $null }
+function Get-WinEvent { param($FilterHashtable, $MaxEvents, $ErrorAction) }
+function Show-Activity { param($Text, $Fraction, $Detail) }
+function Clear-LiveLine { }
+function Restore-Console { }
+function Write-StatusLine { param($Status, $Text, $Note) $script:Log.Add("STATUS $Status $Text") }
+function Write-Host { param($Object, $ForegroundColor) $script:Log.Add("HOST $Object") }
+$root = Join-Path ([IO.Path]::GetTempPath()) ('store-diag-test-' + [guid]::NewGuid().ToString('N'))
+$WorkDir = Join-Path $root 'work'; $LogDir = Join-Path $root 'out'
+$null = New-Item -ItemType Directory -Path (Join-Path $WorkDir 'Logs') -Force
+Set-Content -LiteralPath (Join-Path $WorkDir 'Logs\StoreInstall-20261124-000001.log') -Value '[2026-11-24 00:00:01] [INFO] User      : PC\dave'
+$locked = Join-Path $WorkDir 'Logs\StoreInstall-20261124-000002.log'
+Set-Content -LiteralPath $locked -Value 'busy'
+$before = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'Store-LTSC-diagnostics-*').Count
+$handle = [IO.File]::Open($locked, 'Open', 'ReadWrite', 'None')
+try {
+    Reset-State; $script:Version = 'test'
+    $code = Save-Diagnostics -OsInfo ([pscustomobject]@{}) -OsName 'Windows' -Build 26100 -Revision 1
+} finally { $handle.Dispose() }
+try {
+    $zip = @(Get-ChildItem $LogDir -Filter 'Store-LTSC-diagnostics-*.zip')
+    Assert ($code -eq 0 -and $zip.Count -eq 1) "Collecting must succeed with an unreadable log, got code $code and $($zip.Count) zip(s)."
+    Assert ($script:Log -match '^STATUS WARN installer logs: 1 of 2 readable') 'An unreadable log must be reported as a warning.'
+    Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath (Join-Path $root 'x')
+    Assert ((Get-Content (Join-Path $root 'x\logs\StoreInstall-20261124-000002.log') -Raw) -match '^Unreadable:') 'The unreadable log must be noted in the bundle.'
+    Assert ((Get-Content (Join-Path $root 'x\logs\StoreInstall-20261124-000001.log') -Raw) -notmatch 'dave') 'Copied logs must be redacted.'
+    # A failure while writing the zip still removes the staging folder.
+    function Compress-Archive { param($Path, $DestinationPath, [switch]$Force) throw 'disk full' }
+    $code = Save-Diagnostics -OsInfo ([pscustomobject]@{}) -OsName 'Windows' -Build 26100 -Revision 1
+    Assert ($code -eq 7 -and ($script:Log -match '^STATUS FAIL Could not save the diagnostics: disk full')) 'A failed zip must be reported with exit code 7.'
+    Assert (@(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'Store-LTSC-diagnostics-*').Count -eq $before) 'No staging folder may be left behind.'
+    Remove-Item Function:\Compress-Archive
+} finally { Remove-Item -LiteralPath $root -Recurse -Force; Remove-Item Function:\Write-Host }
+Write-Host 'PASS: diagnostics collection survives an unreadable log and never leaves its staging folder.'
 
 # 6. Option combinations that cannot work are rejected before any system change.
 Remove-Item Function:\Start-Sleep
