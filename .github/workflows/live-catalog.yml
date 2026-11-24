@@ -24,7 +24,7 @@ jobs:
           - { name: 'LTSC 2024 x64', build: 26100, arch: x64 }
           - { name: 'LTSC 2024 ARM64', build: 26100, arch: arm64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download the package set from Microsoft
         shell: pwsh
@@ -68,7 +68,7 @@ jobs:
 
       - name: Keep the log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: log-${{ matrix.build }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/logs
