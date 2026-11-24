@@ -6,6 +6,14 @@ Each release is a Git tag `v<version>` that matches `$StoreLtscVersion` in `inst
 irm https://raw.githubusercontent.com/Softhe/Store-LTSC/v1.0.0/install.ps1 | iex
 ```
 
+## [Unreleased]
+
+### Fixed
+
+- An option value the script rejects, such as `-Source Bogus`, `-DownloadTimeoutSeconds 0` or `-TargetBuild 100000`, now ends the run with exit code 7. Before, the script printed an error, installed nothing and ended with exit code 0, so deployment tools reported success. Through `irm | iex` it left `$LASTEXITCODE` unchanged.
+- A license file is used only when its content is a signed license for the package. Before, a file named `<PackageFamilyName>.xml` or `<Name>_*.xml` was used on its name alone, so a truncated or unrelated file made provisioning fail and hid a valid license in the same folder. The script now logs such a file as ignored.
+- With both Xbox Identity Provider versions in a local folder, the script picks 12.x instead of the legacy 2017.x, which has the higher version number but is older.
+
 ## [1.0.0] - 2026-11-24
 
 The first tagged release. It contains everything the script did before releases existed, plus the changes below.

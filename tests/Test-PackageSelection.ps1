@@ -4,7 +4,7 @@ $source = Join-Path $PSScriptRoot '..\install.ps1'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-$names = @('Get-PackageIdentity', 'Get-PublisherId', 'Read-PackageManifest', 'Get-PackageMetadata', 'Test-TargetDeviceFamily', 'Get-ProvisionedIdentity', 'Get-ArchRank', 'Get-PackageDependencyState', 'Format-MissingDependency', 'Get-DependencyInstallOrder', 'Select-NewerPackage')
+$names = @('Get-PackageIdentity', 'Get-PublisherId', 'Read-PackageManifest', 'Get-PackageMetadata', 'Test-TargetDeviceFamily', 'Get-ProvisionedIdentity', 'Get-ArchRank', 'Get-PackageDependencyState', 'Format-MissingDependency', 'Get-DependencyInstallOrder', 'Select-NewerPackage', 'Test-SameOrNewerVersion')
 foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($node.Name -in $names) { Invoke-Expression $node.Extent.Text }
 }
@@ -39,6 +39,13 @@ try {
     Assert ($selected.Identity.Arch -eq 'x64') 'Incompatible newer app must not win.'
     $emulated = New-Fixture 'Microsoft.WindowsStore' 'x86'
     Assert ((Select-NewerPackage $emulated $native).Identity.Arch -eq 'x64') 'Equal-version app must prefer native architecture.'
+    # Xbox Identity Provider 2017.x is the legacy app; 12.x replaced it despite the lower number. Either order.
+    $xboxNew = New-Fixture 'Microsoft.XboxIdentityProvider' 'x64' '12.130.16001.0'
+    $xboxLegacy = New-Fixture 'Microsoft.XboxIdentityProvider' 'x64' '2017.523.613.1000'
+    Assert ((Select-NewerPackage $xboxNew $xboxLegacy).Identity.Version -eq [version]'12.130.16001.0') 'Legacy Xbox Identity Provider 2017.x must not replace 12.x.'
+    Assert ((Select-NewerPackage $xboxLegacy $xboxNew).Identity.Version -eq [version]'12.130.16001.0') 'Xbox Identity Provider 12.x must replace legacy 2017.x.'
+    $xboxNewer = New-Fixture 'Microsoft.XboxIdentityProvider' 'x64' '12.131.0.0'
+    Assert ((Select-NewerPackage $xboxNew $xboxNewer).Identity.Version -eq [version]'12.131.0.0') 'Newer 12.x must still win over older 12.x.'
     $base = New-Fixture 'Test.Base' 'x64' -Framework
     $dep = '<PackageDependency Name="Test.Base" Publisher="CN=Test" MinVersion="1.0.0.0"/>'
     $top = New-Fixture 'Test.Top' 'x64' -Framework -Dependencies $dep
