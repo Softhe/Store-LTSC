@@ -188,6 +188,11 @@ function Write-StatusLine { param($Status, $Text, $Note) $script:Log.Add("STATUS
 function Write-Host { param($Object, $ForegroundColor) $script:Log.Add("HOST $Object") }
 $root = Join-Path ([IO.Path]::GetTempPath()) ('store-diag-test-' + [guid]::NewGuid().ToString('N'))
 $WorkDir = Join-Path $root 'work'; $LogDir = Join-Path $root 'out'
+# A temporary folder of its own: Save-Diagnostics also collects %TEMP%\StoreInstall-Logs, which on a contributor's
+# PC can hold real installer logs (Greptile review, PR #8). GetTempPath() follows TMP, then TEMP.
+$savedTemp = @{ TMP = $env:TMP; TEMP = $env:TEMP }
+$env:TMP = $env:TEMP = Join-Path $root 'temp'
+$null = New-Item -ItemType Directory -Path $env:TMP -Force
 $null = New-Item -ItemType Directory -Path (Join-Path $WorkDir 'Logs') -Force
 Set-Content -LiteralPath (Join-Path $WorkDir 'Logs\StoreInstall-20261124-000001.log') -Value '[2026-11-24 00:00:01] [INFO] User      : PC\dave'
 $locked = Join-Path $WorkDir 'Logs\StoreInstall-20261124-000002.log'
@@ -211,7 +216,10 @@ try {
     Assert ($code -eq 7 -and ($script:Log -match '^STATUS FAIL Could not save the diagnostics: disk full')) 'A failed zip must be reported with exit code 7.'
     Assert (@(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'Store-LTSC-diagnostics-*').Count -eq $before) 'No staging folder may be left behind.'
     Remove-Item Function:\Compress-Archive
-} finally { Remove-Item -LiteralPath $root -Recurse -Force; Remove-Item Function:\Write-Host }
+} finally {
+    $env:TMP = $savedTemp.TMP; $env:TEMP = $savedTemp.TEMP
+    Remove-Item -LiteralPath $root -Recurse -Force; Remove-Item Function:\Write-Host
+}
 Write-Host 'PASS: diagnostics collection survives an unreadable log and never leaves its staging folder.'
 
 # 6. Option combinations that cannot work are rejected before any system change.
