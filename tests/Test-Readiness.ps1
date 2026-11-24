@@ -168,6 +168,9 @@ try {
     # completely (CodeRabbit review, PR #8).
     $text = Protect-DiagnosticText "Opened C:\Users\Public Smith\file.appx`r`nWork dir  : C:\Users\Jane Smith`r`nProfile 'C:\Users\Default User' and C:\Users\Public"
     Assert ($text -notmatch 'Public Smith|Jane|Smith' -and $text -match 'C:\\Users\\<user>\\file\.appx' -and $text -match 'Work dir  : C:\\Users\\<user>\r' -and $text -match "'C:\\Users\\Default User'" -and $text -match 'C:\\Users\\Public$') "Shared-folder look-alikes and names with spaces must be removed whole, got: $text"
+    # Another account whose profile name starts with this account's (profile C:\Users\Administrator here).
+    $text = Protect-DiagnosticText "C:\Users\Administrator Smith\file.appx and C:\Users\Administrator\AppData`r`nLog file  : C:\Users\Administrator Smith"
+    Assert ($text -notmatch 'Smith|Administrator' -and $text -match 'C:\\Users\\<user>\\file\.appx and %USERPROFILE%\\AppData' -and $text -match 'Log file  : C:\\Users\\<user>$') "An overlapping profile name must not be cut apart, got: $text"
 } finally { foreach ($kv in $saved.GetEnumerator()) { Set-Item -Path "Env:$($kv.Key)" -Value $kv.Value } }
 Write-Host 'PASS: diagnostics text is redacted, including other accounts in logs and events.'
 

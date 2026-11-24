@@ -1613,19 +1613,27 @@ function Protect-DiagnosticText {
     param([AllowNull()][AllowEmptyString()][string] $Text)
     if (-not $Text) { return $Text }
     $Text = [regex]::Replace($Text, 'S-1-5-21-\d+-\d+-\d+-\d+', '<sid>')
-    foreach ($pair in @(@($env:USERPROFILE, '%USERPROFILE%'), @($env:USERNAME, '<user>'), @($env:COMPUTERNAME, '<computer>'), @($env:USERDOMAIN, '<domain>'))) {
+    # Paths first, whole names only. Replacing a name inside a path first would cut it apart: with a profile of
+    # C:\Users\Jane, the folder of another account, C:\Users\Jane Smith, would become "%USERPROFILE% Smith" or
+    # "\Users\<user> Smith" and keep "Smith" (CodeRabbit review, PR #8).
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, Multiline'
+    # 1. This account's profile path, only where it ends: followed by a backslash, a quote or the end of the line.
+    if ($env:USERPROFILE -and $env:USERPROFILE.Length -ge 4) {
+        $Text = [regex]::Replace($Text, [regex]::Escape($env:USERPROFILE.TrimEnd('\')) + '(?=\\|[\r\n"''<>|]|$)', '%USERPROFILE%', $options)
+    }
+    # 2. Any other profile folder. Windows' shared profile folders name no one and are kept, but only as a whole folder
+    #    name: "Public Smith" is an account. A profile name may contain spaces, so a name at the end of a path, where
+    #    nothing marks its end, is replaced up to the end of the line or a quote: that can hide a little of the text
+    #    after it, but never leaves part of a name behind.
+    $chars = '[^\\\r\n"''<>|*?:]'
+    $shared = '(?:Public|Default|Default User|All Users)'
+    $Text = [regex]::Replace($Text, '(?<=\\Users\\)(?!' + $shared + '\\)' + $chars + '+(?=\\)', '<user>', $options)
+    $Text = [regex]::Replace($Text, '(?<=\\Users\\)(?!' + $chars + '*\\)(?!' + $shared + '(?:[\r\n"''<>|]|$))(?!<user>)' + $chars + '+', '<user>', $options)
+    # 3. This account's user, computer and domain names elsewhere in the text.
+    foreach ($pair in @(@($env:USERNAME, '<user>'), @($env:COMPUTERNAME, '<computer>'), @($env:USERDOMAIN, '<domain>'))) {
         if (-not $pair[0] -or $pair[0].Length -lt 2) { continue }
         $Text = [regex]::Replace($Text, '(?<![\w-])' + [regex]::Escape($pair[0]) + '(?![\w-])', $pair[1], 'IgnoreCase')
     }
-    # Any other account's profile folder. Windows' shared profile folders name no one and are kept, but only as a whole
-    # folder name: "Public Smith" is an account. A profile name may contain spaces, so a name at the end of a path,
-    # where nothing marks its end, is replaced up to the end of the line or a quote: that can hide a little of the text
-    # after it, but never leaves part of a name behind.
-    $chars = '[^\\\r\n"''<>|*?:]'
-    $shared = '(?:Public|Default|Default User|All Users)'
-    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, Multiline'
-    $Text = [regex]::Replace($Text, '(?<=\\Users\\)(?!' + $shared + '\\)' + $chars + '+(?=\\)', '<user>', $options)
-    $Text = [regex]::Replace($Text, '(?<=\\Users\\)(?!' + $chars + '*\\)(?!' + $shared + '(?:[\r\n"''<>|]|$))(?!<user>)' + $chars + '+', '<user>', $options)
     # The account and computer an installer log recorded, which may be another user's or another PC's.
     $Text = [regex]::Replace($Text, '(?m)^(\[[^\]\r\n]*\] \[\w+\] User\s*: )[^\r\n(]*?(\s*\(SYSTEM[^\r\n]*)?(\r?)$', '$1<domain>\<user>$2$3')
     $Text = [regex]::Replace($Text, '(?m)^(\[[^\]\r\n]*\] \[\w+\] Computer\s*: )[^\r\n]*?(\r?)$', '$1<computer>$2')
