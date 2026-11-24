@@ -232,7 +232,13 @@ foreach ($case in @(
         @{ DownloadOnly = $true; TargetArch = 'arm' },
         @{ DownloadOnly = $true; TargetBuild = 7601 },
         @{ CollectLogs = $true; DownloadOnly = $true },
-        @{ CollectLogs = $true; FixServices = $true })) {
+        @{ CollectLogs = $true; FixServices = $true },
+        # Values the parameter attributes reject fail while binding; that must still be exit code 7, not 0.
+        @{ Source = 'Bogus' },
+        @{ DownloadTimeoutSeconds = 0 },
+        @{ TargetBuild = 100000 },
+        @{ TargetBuild = 'abc' })) {
+    $global:LASTEXITCODE = 42
     & ([scriptblock]::Create($installerText)) @case *> $null
     Assert ($LASTEXITCODE -eq 7) "Options $(($case.Keys | Sort-Object) -join ', ') must be rejected with exit code 7, got $LASTEXITCODE."
 }

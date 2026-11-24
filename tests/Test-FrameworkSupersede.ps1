@@ -202,6 +202,22 @@ try {
     $copied = Copy-LicenseToFolder -Path $released -Destination $packages -Family $family
     Assert ($copied -eq (Join-Path $packages "$family.xml") -and (Test-StoreLicense $copied $family)) 'A license from another folder must be copied into the package folder.'
     Assert ((Copy-LicenseToFolder -Path $released -Destination $licenseDir -Family $family) -eq $released) 'A license already in the package folder is used where it is.'
+
+    # A file with the expected name is used only when it really is the license: a truncated or unrelated file must
+    # not reach Add-AppxProvisionedPackage, and must not hide a valid license elsewhere in the folder.
+    $nameDir = Join-Path $licenseDir 'byname'
+    $null = New-Item -ItemType Directory -Path $nameDir
+    $wingetIdentity = [pscustomobject]@{ Name = 'Microsoft.DesktopAppInstaller'; Family = $family }
+    $exact = Join-Path $nameDir "$family.xml"
+    Set-Content -LiteralPath $exact -Value 'not a license'
+    Set-Content -LiteralPath (Join-Path $nameDir 'Microsoft.DesktopAppInstaller_old.xml') -Value '<License/>'
+    Assert ($null -eq (Find-License -PackagePath (Join-Path $nameDir 'winget.msixbundle') -Identity $wingetIdentity)) 'Files that only have a license name must be ignored.'
+    Assert ($script:Log -match "^\[WARN\] Ignoring .*$([regex]::Escape("$family.xml")): not a signed license") 'An ignored license file must be logged.'
+    $valid = Join-Path $nameDir 'e53e159d00e04f729cc2180cffd1c02e_License1.xml'
+    Set-Content -LiteralPath $valid -Value $licenseXml
+    Assert ((Find-License -PackagePath (Join-Path $nameDir 'winget.msixbundle') -Identity $wingetIdentity) -eq $valid) 'A valid license must win over an invalid file with the expected name.'
+    Set-Content -LiteralPath $exact -Value $licenseXml
+    Assert ((Find-License -PackagePath (Join-Path $nameDir 'winget.msixbundle') -Identity $wingetIdentity) -eq $exact) 'A valid <PackageFamilyName>.xml must still be preferred.'
 } finally { Remove-Item -LiteralPath $licenseDir -Recurse -Force }
 
 Write-Host 'PASS: superseded frameworks and newer installed apps are skipped or deferred to verification, older apps are upgraded, real failures are counted, errors log on one line, and App Installer gets its license.'

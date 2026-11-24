@@ -989,20 +989,24 @@ function Find-License {
     $dirs = @([IO.Path]::GetDirectoryName($PackagePath)) + @($script:LicenseDirs) | Select-Object -Unique
 
     foreach ($dir in $dirs) {
-        if ($Identity.Family) {
-            $exact = Join-Path $dir ($Identity.Family + '.xml')
-            if (Test-Path -LiteralPath $exact -PathType Leaf) { return $exact }
+        $xmlFiles = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.xml' -ErrorAction SilentlyContinue | Sort-Object Name)
+        # Require "<Name>_" or "<Name>.xml" so e.g. Microsoft.VCLibs.140.00 does not pick up the UWPDesktop license.
+        $named = @($xmlFiles | Where-Object { $_.Name -like ($Identity.Name + '_*') -or $_.Name -eq ($Identity.Name + '.xml') })
+        if (-not $Identity.Family) {
+            # Without a family name the content cannot be checked; fall back to the file name alone.
+            if ($named.Count -gt 0) { return $named[0].FullName }
+            continue
         }
 
-        # Require "<Name>_" or "<Name>.xml" so e.g. Microsoft.VCLibs.140.00 does not pick up the UWPDesktop license.
-        $xmlFiles = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.xml' -ErrorAction SilentlyContinue | Sort-Object Name)
-        $cand = $xmlFiles | Where-Object { $_.Name -like ($Identity.Name + '_*') -or $_.Name -eq ($Identity.Name + '.xml') } | Select-Object -First 1
-        if ($cand) { return $cand.FullName }
-
-        # Otherwise read the licenses themselves: the winget release names its file "<hash>_License1.xml".
-        if ($Identity.Family) {
-            $cand = $xmlFiles | Where-Object { $_.Length -le 65536 -and (Test-StoreLicense -Path $_.FullName -Family $Identity.Family) } | Select-Object -First 1
-            if ($cand) { return $cand.FullName }
+        # Preferred order: "<PackageFamilyName>.xml", then "<Name>_*.xml", then any license in the folder (the winget
+        # release names its file "<hash>_License1.xml"). Every candidate must be a signed license for this family:
+        # a truncated or unrelated file under the expected name would otherwise make provisioning fail.
+        $exactName = $Identity.Family + '.xml'
+        $candidates = @($xmlFiles | Where-Object { $_.Name -eq $exactName }) + @($named | Where-Object { $_.Name -ne $exactName }) +
+            @($xmlFiles | Where-Object { $_.Name -ne $exactName -and $named -notcontains $_ })
+        foreach ($file in $candidates) {
+            if ($file.Length -le 65536 -and (Test-StoreLicense -Path $file.FullName -Family $Identity.Family)) { return $file.FullName }
+            if ($file.Name -eq $exactName -or $named -contains $file) { Write-Log "Ignoring $($file.FullName): not a signed license for $($Identity.Family)" 'WARN' -Quiet }
         }
     }
     return $null
@@ -1135,7 +1139,9 @@ function Select-NewerPackage {
     if (-not $Current) { return $Candidate }
     $curVer = if ($Current.Identity.Version) { $Current.Identity.Version } else { [version]'0.0' }
     $candVer = if ($Candidate.Identity.Version) { $Candidate.Identity.Version } else { [version]'0.0' }
-    $keep, $drop = if ($candVer -gt $curVer -or ($candVer -eq $curVer -and $Candidate.Rank -gt $Current.Rank)) { $Candidate, $Current } else { $Current, $Candidate }
+    # Same ordering as the installed-version checks, so the legacy Xbox Identity Provider 2017.x loses to 12.x.
+    $candNewer = -not (Test-SameOrNewerVersion $Candidate.Identity.Name $curVer $candVer)
+    $keep, $drop = if ($candNewer -or ($candVer -eq $curVer -and $Candidate.Rank -gt $Current.Rank)) { $Candidate, $Current } else { $Current, $Candidate }
     Write-Log "Multiple packages for $($keep.Identity.Name); using $($keep.File.Name), ignoring $($drop.File.Name)" 'WARN'
     return $keep
 }
@@ -2751,6 +2757,7 @@ $global:LASTEXITCODE = $StoreLtscExitCode
 $forward = @{}
 $stringParameters = @('WorkDir', 'LogDir', 'Source', 'DownloadDir', 'DownloadTimeoutSeconds', 'TargetBuild', 'TargetArch', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable')
 $switchParameters = @('DownloadOnly', 'KeepDownloads', 'NoProvision', 'SkipWinget', 'FixServices', 'CollectLogs', 'PauseAtEnd', 'Verbose', 'Debug')
+$optionError = $null
 try {
 if (@($InvocationArguments | Where-Object { @('-?', '/?', '-h', '-help', '--help') -contains [string]$_ }).Count -gt 0) {
     foreach ($helpLine in @(
@@ -2813,14 +2820,22 @@ for ($index = 0; $index -lt $InvocationArguments.Count; $index++) {
     else { throw "Unknown parameter -$name. Run with -Help to list the options." }
 }
 }
-catch {
+catch { $optionError = $_.Exception.Message }
+if (-not $optionError) {
+    # A value the parameter attributes reject (e.g. -Source Bogus, -TargetBuild 100000) fails while binding, before
+    # the installer runs. PowerShell reports that as an error but does not end the script with a failing exit code.
+    try { Invoke-StoreLtsc @forward }
+    catch [System.Management.Automation.ParameterBindingException] {
+        if ($_.InvocationInfo.MyCommand.Name -ne 'Invoke-StoreLtsc') { throw }
+        $optionError = $_.Exception.Message
+    }
+}
+if ($optionError) {
     # An option that cannot be understood is an invalid configuration (exit code 7), not a missing-elevation error.
     Write-Host ''
-    Write-Host ('    FAIL  ' + $_.Exception.Message) -ForegroundColor Red
+    Write-Host ('    FAIL  ' + $optionError) -ForegroundColor Red
     Write-Host ''
     if ($OriginalScriptPath) { exit 7 }
     $global:LASTEXITCODE = 7
-    return
 }
-Invoke-StoreLtsc @forward
 } $args $PSCommandPath

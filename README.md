@@ -16,12 +16,6 @@
 
 LTSC and IoT Enterprise editions of Windows ship without Microsoft Store. Store-LTSC downloads the Store, its companion apps and winget straight from Microsoft, checks every file, and installs them for you and for every new user on the PC.
 
-<p align="center">
-  <a href="assets/installer-console-ltsc2024.png"><img src="assets/installer-console-ltsc2024.png" width="720" alt="Installer console on a fresh Windows 11 IoT Enterprise LTSC 2024: five numbered steps (checking Windows, downloading 10 packages, installing 6 frameworks and 4 apps, verifying that winget runs), then Microsoft Store is installed, 10 installed, exit code 0"></a>
-  <br>
-  <sub>A fresh install on Windows 11 IoT Enterprise LTSC 2024: 10 packages in about a minute.</sub>
-</p>
-
 ## Install
 
 Open PowerShell and run:
@@ -29,6 +23,12 @@ Open PowerShell and run:
 ```powershell
 irm https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1 | iex
 ```
+
+<p align="center">
+  <a href="assets/installer-console-ltsc2024.png"><img src="assets/installer-console-ltsc2024.png" width="720" alt="Installer console on a fresh Windows 11 IoT Enterprise LTSC 2024: five numbered steps (checking Windows, downloading 10 packages, installing 6 frameworks and 4 apps, verifying that winget runs), then Microsoft Store is installed, 10 installed, exit code 0"></a>
+  <br>
+  <sub>A fresh install on Windows 11 IoT Enterprise LTSC 2024: 10 packages in about a minute.</sub>
+</p>
 
 When it finishes, open **Microsoft Store** from the Start menu. If the Store doesn't start, restart Windows and try again.
 
