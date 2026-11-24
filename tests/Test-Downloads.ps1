@@ -86,6 +86,7 @@ try {
     } finally { $server.Stop(); $serverShell.Dispose() }
     Write-Host 'PASS: download reports progress and resumes a partial file.'
     function Initialize-Network { }
+    function Test-Clock { }
     function Get-Fe3DeviceAttributes { param($OsArch, $Build) 'test' }
     function Get-Fe3Cookie { 'test' }
     function Get-WuCategoryId { param($PackageFamilyName) if ($PackageFamilyName -eq 'Winget') { throw 'mock lookup failure' }; 'store-category' }
@@ -121,6 +122,16 @@ try {
     $saved = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     if (@($saved.Files).Count -ne 3) { throw 'Manifest must list only downloaded files' }
     Write-Host 'PASS: only declared frameworks (including nested dependencies) are downloaded.'
+    # A framework an app declares but the service does not offer: an install may still find it on the PC, but a
+    # download-only folder would be incomplete, so -RequireComplete makes it a failure and the manifest records it.
+    function Get-Fe3PackageList { param($CategoryId, $Cookie, $DeviceAttributes) (New-Offer sample Store); (New-Offer used Fw.Used -Framework) }
+    $script:FailCount = 0; $script:Failures.Clear()
+    $null = @(Save-OnlinePackages -Destination $folder -Families @('Store') -OsArch x64 -Build 19041)
+    $saved = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($script:FailCount -ne 0 -or @($saved.MissingDependencies) -notcontains 'Fw.Nested 1.0 or newer (x64)') { throw "An install run must record, not fail, a framework the service does not offer (failures $script:FailCount, manifest '$(@($saved.MissingDependencies) -join ', ')')" }
+    $null = @(Save-OnlinePackages -Destination $folder -Families @('Store') -OsArch x64 -Build 19041 -RequireComplete)
+    if ($script:FailCount -ne 1 -or $script:Failures[0] -notmatch 'Framework not offered: Fw\.Nested') { throw 'A download-only run must fail when a declared framework is not offered.' }
+    Write-Host 'PASS: a declared framework the service does not offer fails a download-only run and is recorded in the manifest.'
     # The service offers the same packages to every Windows build. A best version that needs a newer Windows
     # is replaced by the next version on offer; with no usable Store version the download fails.
     foreach ($n in 'new', 'old') { Set-Content -LiteralPath (Join-Path $folder "$n.appx") -Value $n }

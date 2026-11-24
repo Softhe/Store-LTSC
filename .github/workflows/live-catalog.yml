@@ -1,0 +1,100 @@
+# Runs the real online download every day against Microsoft's Store delivery service. The regression tests mock that
+# service; this job notices when Microsoft changes it, stops offering a package for a Windows build, or the winget
+# license can no longer be fetched. A scheduled failure opens (or comments on) one tracking issue.
+name: Live catalog check
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    name: ${{ matrix.name }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'LTSC 2021 x64', build: 19044, arch: x64 }
+          - { name: 'LTSC 2024 x64', build: 26100, arch: x64 }
+          - { name: 'LTSC 2024 ARM64', build: 26100, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the package set from Microsoft
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'packages'
+          $logs = Join-Path $env:RUNNER_TEMP 'logs'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./install.ps1 -DownloadOnly `
+            -TargetBuild ${{ matrix.build }} -TargetArch ${{ matrix.arch }} -DownloadDir $dir -LogDir $logs
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "install.ps1 -DownloadOnly exited with code $code" }
+
+      # Also after a failed download (exit 5 for a missing app or framework), so the summary says what was missing.
+      # The job still fails: the download step's failure stands.
+      - name: Check the downloaded set
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'packages'
+          $manifestPath = Join-Path $dir 'store-packages.json'
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            "### ${{ matrix.name }}`n`nNo package manifest: the download stopped before writing one. See the installer log artifact." | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            throw 'No store-packages.json was written'
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          $problems = @()
+          if ($manifest.Build -ne ${{ matrix.build }} -or $manifest.OsArch -ne '${{ matrix.arch }}') { $problems += "manifest targets $($manifest.Build) $($manifest.OsArch)" }
+          if (@($manifest.MissingFamilies).Count -gt 0) { $problems += "missing apps: $(@($manifest.MissingFamilies) -join ', ')" }
+          # Frameworks the apps declare but the service did not offer: the folder could not install on a clean PC.
+          if ($manifest.PSObject.Properties['MissingDependencies'] -and @($manifest.MissingDependencies).Count -gt 0) { $problems += "frameworks not offered: $(@($manifest.MissingDependencies) -join ', ')" }
+          $files = @($manifest.Files | ForEach-Object Name)
+          foreach ($app in 'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.XboxIdentityProvider', 'Microsoft.DesktopAppInstaller') {
+            if (-not ($files -like "${app}_*")) { $problems += "no $app package" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $dir 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.xml'))) { $problems += 'no winget license' }
+
+          $summary = @("### ${{ matrix.name }} (build ${{ matrix.build }}, ${{ matrix.arch }})", '', '| Package | Size |', '| --- | ---: |')
+          foreach ($file in $manifest.Files | Sort-Object Name) { $summary += '| `{0}` | {1:N1} MB |' -f $file.Name, ($file.Size / 1MB) }
+          if ($problems) { $summary += ''; $summary += $problems | ForEach-Object { "- **Problem:** $_" } }
+          $summary -join "`n" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          if ($problems) { throw ($problems -join '; ') }
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.build }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    needs: download
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='Live catalog check is failing'
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number' | head -n 1)
+          body="The scheduled download from Microsoft's Store delivery service failed: $RUN_URL"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "Still failing: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "$body
+
+          The job summary lists the packages and the problem; each job keeps its installer log as an artifact. Close this issue when the check passes again."
+          fi

@@ -61,6 +61,20 @@
 .PARAMETER SkipWinget
   Do not install DesktopAppInstaller even if the bundle is present (and do not download it).
 
+.PARAMETER TargetBuild
+  With -DownloadOnly: pick packages for this Windows build instead of this machine's (e.g. 19044 for LTSC 2021).
+
+.PARAMETER TargetArch
+  With -DownloadOnly: pick packages for this architecture (x64, arm64 or x86) instead of this machine's.
+
+.PARAMETER FixServices
+  Set Windows services the Store needs (Windows Update, Store Install Service, licensing, Delivery Optimization,
+  AppX deployment, ...) from Disabled back to Manual before installing. Without it, disabled services are reported.
+
+.PARAMETER CollectLogs
+  Install nothing. Save a diagnostics zip (system details, services, policies, installed packages, AppX event log
+  and recent installer logs, with user and computer names removed) to attach to a bug report.
+
 .PARAMETER PauseAtEnd
   Wait for Enter before exiting (used for the elevated window opened by the UAC relaunch).
 
@@ -75,6 +89,8 @@
     6 Store install failed
     7 fatal/internal
     8 download or download verification failed
+    9 Windows is not ready: a service that app installation needs is disabled (see -FixServices), or a restart is
+      needed before Windows applies -FixServices
 
   Tips:
     1. Needs admin rights; packages are downloaded from Microsoft (or taken from -WorkDir).
@@ -89,6 +105,8 @@ param([object[]] $InvocationArguments, [string] $OriginalScriptPath)
 
 # Keep parameter binding and all implementation variables out of the caller's scope.
 $OriginalScriptText = '#Requires -Version 5.1' + [Environment]::NewLine + '& {' + [Environment]::NewLine + $MyInvocation.MyCommand.ScriptBlock.ToString() + [Environment]::NewLine + '} $args $PSCommandPath'
+# Release version. The release workflow checks that the pushed tag (v<version>) matches it.
+$StoreLtscVersion = '1.0.0'
 function Invoke-StoreLtsc {
 [CmdletBinding()]
 param(
@@ -97,10 +115,14 @@ param(
     [ValidateSet('Auto', 'Local', 'Online')][string] $Source = 'Online',
     [string] $DownloadDir,
     [ValidateRange(1, 86400)][int] $DownloadTimeoutSeconds = 1800,
+    [ValidateRange(0, 99999)][int] $TargetBuild = 0,
+    [string] $TargetArch = '',
     [switch] $DownloadOnly,
     [switch] $KeepDownloads,
     [switch] $NoProvision,
     [switch] $SkipWinget,
+    [switch] $FixServices,
+    [switch] $CollectLogs,
     [switch] $PauseAtEnd
 )
 
@@ -111,12 +133,15 @@ $StoreLtscInvocation = @{
     Params     = @{
         WorkDir = $WorkDir; LogDir = $LogDir; Source = $Source; DownloadDir = $DownloadDir
         DownloadTimeoutSeconds = $DownloadTimeoutSeconds
+        TargetBuild = $TargetBuild; TargetArch = $TargetArch
         DownloadOnly = [bool]$DownloadOnly; KeepDownloads = [bool]$KeepDownloads
         NoProvision = [bool]$NoProvision; SkipWinget = [bool]$SkipWinget
+        FixServices = [bool]$FixServices; CollectLogs = [bool]$CollectLogs
     }
     Bound      = @{}
     ScriptPath = $OriginalScriptPath
     ScriptText = $OriginalScriptText
+    Version    = $StoreLtscVersion
 }
 foreach ($kv in $PSBoundParameters.GetEnumerator()) { $StoreLtscInvocation.Bound[$kv.Key] = $kv.Value }
 
@@ -128,10 +153,13 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Appx/DISM progress bars slow down and clutter non-interactive runs
 
+# Defaults for options a caller (or an older relaunch) may not pass.
+$TargetBuild = 0; $TargetArch = ''; $FixServices = $false; $CollectLogs = $false
 foreach ($kv in $Invocation.Params.GetEnumerator()) { Set-Variable -Name $kv.Key -Value $kv.Value }
 $script:BoundParams = $Invocation.Bound
 $script:ScriptPath = $Invocation.ScriptPath
 $script:ScriptText = $Invocation.ScriptText
+$script:Version = if ($Invocation.ContainsKey('Version') -and $Invocation.Version) { [string]$Invocation.Version } else { 'dev' }
 
 $script:LogFile = $null
 $script:FailCount = 0
@@ -184,6 +212,13 @@ $script:InstallPosition = ''
 $script:Completed = $false
 $script:NetworkState = $null
 $script:SavedModulePath = $null
+# Problems with Windows itself (disabled services, policies, the clock) that do not stop the install but can keep the
+# Store from working. They are repeated under the summary whatever the exit code.
+$script:Advisories = New-Object System.Collections.Generic.List[string]
+$script:WingetLicenseMissing = $false
+$script:RestartRequired = $false
+# How long verification waits for a registration Windows is still finishing.
+$script:RegistrationGraceSeconds = 20
 
 function Initialize-Console {
     $script:LiveUi = $false
@@ -478,6 +513,7 @@ function Complete-Run {
             5 { 'Finished with problems' }
             6 { 'Microsoft Store could not be installed' }
             8 { 'Download failed' }
+            9 { 'Windows is not ready for app installation' }
             default { 'Stopped by an error' }
         }
     }
@@ -506,6 +542,12 @@ function Complete-Run {
     $facts.Add("exit code $Code")
     Write-Host ('  ' + ($facts -join ', ')) -ForegroundColor DarkGray
     if ($Code -ne 0) { foreach ($failure in @($script:Failures)) { if ($failure) { Write-Host "    - $failure" -ForegroundColor $color } } }
+    $advisories = @(if (Test-Path Variable:script:Advisories) { $script:Advisories })
+    if ($advisories.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  Windows settings that can stop Microsoft Store from working:' -ForegroundColor Yellow
+        foreach ($advice in $advisories) { Write-Host "    - $advice" -ForegroundColor Yellow }
+    }
     if ($Hint) { Write-Host ''; Write-Host "  $Hint" }
     if ($script:LogFile) { Write-Host "  Log: $script:LogFile" -ForegroundColor DarkGray }
     Write-Host ''
@@ -553,7 +595,8 @@ function Invoke-Relaunch {
         if ($bound.ContainsKey('LogDir')) { $bound['LogDir'] = $LogDir }
         if ($bound.ContainsKey('DownloadDir')) { $bound['DownloadDir'] = $DownloadDir }
         # Without a work folder (irm | iex), the log goes to %TEMP%; a saved copy keeps logging to <WorkDir>\Logs.
-        if (-not $bound.ContainsKey('LogDir') -and -not $WorkDir) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
+        # Not for -CollectLogs: there -LogDir is where the zip goes, and only the user may choose that over the desktop.
+        if (-not $bound.ContainsKey('LogDir') -and -not $WorkDir -and -not $CollectLogs) { $bound['LogDir'] = Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
 
         foreach ($key in @($bound.Keys)) {
             if ($bound[$key] -is [System.Management.Automation.SwitchParameter]) { $bound[$key] = [bool]$bound[$key] }
@@ -842,13 +885,23 @@ function Test-InstallResult {
     # Returns $false if the Store is not registered.
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Applications, [object[]] $Frameworks = @())
     $storeRegistered = $true
+    $wingetRegistered = $false
     if (-not $script:IsSystem -and @($Applications).Count -gt 0) {
         $verified = 0
         foreach ($app in $Applications) {
             $registered = @(Get-AppxPackage -Name $app.Identity.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.Status -eq 'Ok' })
+            # Windows can still be servicing a package it registered moments ago, for example adding a language
+            # resource pack, and leaves it out of the list meanwhile. Seen on 2026-11-24: App Installer was registered
+            # with status Ok, missing in the same second while its Swedish resource pack was added, then Ok again.
+            for ($wait = 1; $registered.Count -eq 0 -and $wait -le $script:RegistrationGraceSeconds; $wait++) {
+                Start-Sleep -Seconds 1
+                $registered = @(Get-AppxPackage -Name $app.Identity.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.Status -eq 'Ok' })
+                if ($registered.Count -gt 0) { Write-Log "$($app.Identity.Name) was registered after $wait more second(s)" -Quiet }
+            }
             if ($registered.Count -gt 0) {
                 Write-Log "Verified (current user): $($app.Identity.Name) $($registered[0].Version), status Ok" -Quiet
                 $verified++
+                if ($app.Identity.Name -eq 'Microsoft.DesktopAppInstaller') { $wingetRegistered = $true }
                 continue
             }
             Write-Log "Not registered for the current user after installation: $($app.Identity.Name)" 'ERROR'
@@ -856,6 +909,7 @@ function Test-InstallResult {
             if ($app.Identity.Name -eq 'Microsoft.WindowsStore') { $storeRegistered = $false }
         }
         if ($verified -gt 0) { Write-Item $(if ($verified -eq @($Applications).Count) { 'OK' } else { 'WARN' }) "This user: $verified of $(@($Applications).Count) app(s) registered and ready" }
+        if ($wingetRegistered) { $null = Test-WingetCommand }
     }
     if (-not $script:DoProvision) { return $storeRegistered }
 
@@ -993,28 +1047,55 @@ function Save-WingetLicense {
     $part = "$target.$([guid]::NewGuid().ToString('N')).tmp"
     try {
         Show-Activity -Text 'App Installer license' -Detail 'github.com/microsoft/winget-cli'
-        $release = Invoke-WithRetry -What 'winget release lookup' -Attempts 2 -Action {
-            Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -UseBasicParsing -TimeoutSec 30
-        }
-        $asset = @($release.assets | Where-Object { $_.name -match '_License1\.xml$' -and $_.size -le 65536 }) | Select-Object -First 1
-        if (-not $asset -or [string]$asset.browser_download_url -notmatch '^https://github\.com/microsoft/winget-cli/releases/download/') {
-            throw "release $($release.tag_name) has no license file"
+        $asset = Get-WingetLicenseAsset
+        if ([string]$asset.Url -notmatch '^https://github\.com/microsoft/winget-cli/releases/download/[^/?#]+/[^/?#]+_License1\.xml$') {
+            throw "unexpected license address $($asset.Url)"
         }
         $null = Invoke-WithRetry -What 'winget license download' -Attempts 2 -Action {
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $part -UseBasicParsing -TimeoutSec 60
+            Invoke-WebRequest -Uri $asset.Url -OutFile $part -UseBasicParsing -TimeoutSec 60
         }
-        if (-not (Test-StoreLicense -Path $part -Family $script:WingetFamily)) { throw 'the downloaded file is not a signed license for App Installer' }
+        if ((Get-Item -LiteralPath $part).Length -gt 65536 -or -not (Test-StoreLicense -Path $part -Family $script:WingetFamily)) { throw 'the downloaded file is not a signed license for App Installer' }
         Move-Item -LiteralPath $part -Destination $target -Force
-        Write-Log "App Installer license: $($asset.name) from winget $($release.tag_name)" -Quiet
-        Write-Item OK (Format-PackageLabel ([pscustomobject]@{ Name = 'App Installer license'; Version = $release.tag_name; Arch = '' })) 'from github.com/microsoft/winget-cli'
+        Write-Log "App Installer license: $($asset.Name) from winget $($asset.Tag)" -Quiet
+        Write-Item OK (Format-PackageLabel ([pscustomobject]@{ Name = 'App Installer license'; Version = $asset.Tag; Arch = '' })) 'from github.com/microsoft/winget-cli'
         return $target
     }
     catch {
+        $script:WingetLicenseMissing = $true
         Write-Log "App Installer license unavailable: $($_.Exception.Message)" 'WARN' -Console "App Installer license could not be downloaded ($($_.Exception.Message)); winget will report 'No applicable app licenses found'"
         Add-Failure 'App Installer license unavailable: winget will not run'
         return $null
     }
     finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-WingetLicenseAsset {
+    # The license file of the latest winget release, as @{ Tag; Name; Url }. Asks the GitHub API first. The API allows
+    # 60 unauthenticated requests per hour per address, which offices and schools behind one address can use up, so
+    # the release page is the fallback.
+    try {
+        $release = Invoke-WithRetry -What 'winget release lookup' -Attempts 2 -Action {
+            Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -UseBasicParsing -TimeoutSec 30
+        }
+        $asset = @($release.assets | Where-Object { $_.name -match '_License1\.xml$' -and $_.size -le 65536 }) | Select-Object -First 1
+        if (-not $asset) { throw "release $($release.tag_name) has no license file" }
+        return [pscustomobject]@{ Tag = [string]$release.tag_name; Name = [string]$asset.name; Url = [string]$asset.browser_download_url }
+    }
+    catch {
+        Write-Log "GitHub API lookup failed ($($_.Exception.Message)); reading the release page instead" 'WARN' -Quiet
+    }
+    # /releases/latest redirects to /releases/tag/<tag>; the asset list of a release is served as a page fragment.
+    $latest = Invoke-WithRetry -What 'winget release page' -Attempts 2 -Action {
+        Invoke-WebRequest -Uri 'https://github.com/microsoft/winget-cli/releases/latest' -UseBasicParsing -TimeoutSec 30
+    }
+    $finalUri = [string]$latest.BaseResponse.ResponseUri
+    if ($finalUri -notmatch '/releases/tag/(?<tag>[A-Za-z0-9._-]+)$') { throw "could not find the latest winget release ($finalUri)" }
+    $tag = $Matches['tag']
+    $assets = Invoke-WithRetry -What 'winget release assets' -Attempts 2 -Action {
+        Invoke-WebRequest -Uri "https://github.com/microsoft/winget-cli/releases/expanded_assets/$tag" -UseBasicParsing -TimeoutSec 30
+    }
+    if ([string]$assets.Content -notmatch 'href="(?<path>/microsoft/winget-cli/releases/download/[^"/]+/(?<name>[^"/]+_License1\.xml))"') { throw "release $tag has no license file" }
+    return [pscustomobject]@{ Tag = $tag; Name = $Matches['name']; Url = 'https://github.com' + $Matches['path'] }
 }
 
 function Test-IsFrameworkPackage {
@@ -1143,6 +1224,7 @@ function Install-OnePackage {
             Write-Log "No license XML for ${name}; provisioning with -SkipLicense" $(if ($script:IsOnline -and -not $needsLicense) { 'INFO' } else { 'WARN' }) -Quiet
             if ($needsLicense) {
                 $warn = $true
+                $script:WingetLicenseMissing = $true
                 $notes.Add('no license file: winget will not run')
                 # Online runs already counted the failed license download.
                 if (-not $script:IsOnline) { Add-Failure 'App Installer has no license file: winget will not run (add the *_License1.xml from the winget release)' }
@@ -1162,6 +1244,8 @@ function Install-OnePackage {
         }
         catch {
             $msg = Format-ErrorText $_.Exception.Message
+            $code = Get-DeploymentErrorCode $_
+            if ($code) { $msg = "[$code] $msg" }
             # DISM can reject an older package when a newer one is already installed ("Element not found").
             # The post-install check decides whether new users still get everything. That does not apply when the
             # step was only adding a license: the installed copy is the one still missing it, so this is a failure.
@@ -1203,10 +1287,18 @@ function Install-OnePackage {
             }
             catch {
                 $msg = Format-ErrorText $_.Exception.Message
-                # Non-fatal: 0x80073D06 = higher version already installed, 0x80073CFB = same identity already installed
-                if ($msg -match '0x80073D06|0x80073CFB|higher version|already installed') {
+                $code = Get-DeploymentErrorCode $_
+                if ($code) { $msg = "[$code] $msg" }
+                # Non-fatal: 0x80073D06 = higher version already installed, 0x80073CFB = same identity already installed.
+                # The code is read from the exception; the English text is only a fallback for older error formats.
+                if (@('0x80073D06', '0x80073CFB') -contains $code -or $msg -match '0x80073D06|0x80073CFB|higher version|already installed') {
                     Write-Log "Install skipped/non-fatal: $name :: $msg" 'WARN' -Quiet
-                    if (-not $present -and $msg -match 'higher version (\d+(?:\.\d+){1,3})') { $present = $Matches[1] }
+                    if (-not $present) {
+                        # Ask Windows for the installed version instead of parsing it from the (localized) error text.
+                        $installed = @(Find-InstalledFramework -Identity $Package.Identity -Scope AllUsers -App:$isApp)
+                        if ($installed.Count -gt 0) { $present = $installed[0].Version }
+                        elseif ($msg -match 'higher version (\d+(?:\.\d+){1,3})') { $present = $Matches[1] }
+                    }
                     # A newer copy exists on the machine but this user has none: register that copy instead.
                     $healthy = @(Get-AppxPackage -Name $Package.Identity.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.Status -eq 'Ok' })
                     if ($isApp -and $Package.Identity.Family -and $healthy.Count -eq 0) {
@@ -1240,6 +1332,459 @@ function Install-OnePackage {
 }
 # endregion
 
+# region Windows readiness
+# Services Microsoft Store and app installation depend on. LTSC "debloat" scripts often disable them; the install
+# then reports success, but the Store cannot download, license or install apps (typically error 0x80070422).
+# Required: app installation itself fails without it. Default: the start type -FixServices restores.
+$script:StoreServices = @(
+    [pscustomobject]@{ Name = 'AppXSvc';         Title = 'AppX Deployment Service';         Use = 'installing apps';                 Required = $true }
+    [pscustomobject]@{ Name = 'StateRepository'; Title = 'State Repository Service';        Use = 'installing and starting apps';    Required = $true }
+    [pscustomobject]@{ Name = 'ClipSVC';         Title = 'Client License Service';          Use = 'Store app licenses';              Required = $false }
+    [pscustomobject]@{ Name = 'LicenseManager';  Title = 'Windows License Manager';         Use = 'Store app licenses';              Required = $false }
+    [pscustomobject]@{ Name = 'InstallService';  Title = 'Microsoft Store Install Service'; Use = 'Store downloads';                 Required = $false }
+    [pscustomobject]@{ Name = 'wuauserv';        Title = 'Windows Update';                  Use = 'Store downloads and app updates'; Required = $false }
+    [pscustomobject]@{ Name = 'DoSvc';           Title = 'Delivery Optimization';           Use = 'Store downloads';                 Required = $false }
+    [pscustomobject]@{ Name = 'TokenBroker';     Title = 'Web Account Manager';             Use = 'signing in to the Store';         Required = $false }
+)
+# Policies that keep an installed Store from working. They are an administrator's decision, so they are reported,
+# never changed. UserToo: the policy also exists under HKCU (User Configuration).
+$script:StorePolicies = @(
+    [pscustomobject]@{ Key = 'SOFTWARE\Policies\Microsoft\WindowsStore'; Name = 'RemoveWindowsStore'; Text = 'turns off the Microsoft Store app'; UserToo = $true }
+    [pscustomobject]@{ Key = 'SOFTWARE\Policies\Microsoft\WindowsStore'; Name = 'DisableStoreApps'; Text = 'turns off all Store apps'; UserToo = $false }
+    [pscustomobject]@{ Key = 'SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DoNotConnectToWindowsUpdateInternetLocations'; Text = 'blocks the Windows Update servers that Store downloads use'; UserToo = $false }
+)
+
+function Get-ServiceStartValue {
+    # The service's Start value (2 automatic, 3 manual, 4 disabled), or $null when the service does not exist.
+    # Read from the registry: protected services such as ClipSVC are not always visible to Get-Service.
+    param([Parameter(Mandatory)][string] $Name)
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\$Name")
+    if (-not $key) { return $null }
+    try {
+        $value = $key.GetValue('Start')
+        if ($null -eq $value) { return $null }
+        return [int]$value
+    }
+    finally { $key.Dispose() }
+}
+
+function Set-ServiceManual {
+    # Sets a disabled service to Manual: Windows starts it when an app or the Store asks for it. Returns $true when the
+    # change applies now, $false when it applies only after Windows restarts.
+    # AppXSvc, ClipSVC and DoSvc refuse configuration through the service manager even to administrators (only
+    # TrustedInstaller may change AppXSvc). Their registry value can still be written, but the service manager reads it
+    # only at startup: until Windows restarts it keeps treating the service as disabled, although every query (sc qc,
+    # Get-Service) already reports Manual. Seen on Windows 11 IoT Enterprise LTSC 2024, 2026-11-23.
+    param([Parameter(Mandatory)][string] $Name)
+    $now = $true
+    try { Set-Service -Name $Name -StartupType Manual -ErrorAction Stop }
+    catch {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\$Name", $true)
+        if (-not $key) { throw }
+        try { $key.SetValue('Start', 3, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
+        Write-Log "Service manager refused to change $($Name) ($(Format-ErrorText $_.Exception.Message)); set its registry value, which applies after a restart" -Quiet
+        $now = $false
+    }
+    if ((Get-ServiceStartValue $Name) -ne 3) { throw "the start type of $Name did not change" }
+    return $now
+}
+
+function Test-ServiceCanStart {
+    # Starts a stopped service to prove Windows will run it. Returns $false only when Windows refuses because it still
+    # treats the service as disabled (error 1058): a start type changed in the registry applies after a restart.
+    param([Parameter(Mandatory)][string] $Name)
+    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $service -or $service.Status -ne 'Stopped') { return $true }
+    try { Start-Service -Name $Name -ErrorAction Stop; Write-Log "Started service $Name to check that it runs" -Quiet; return $true }
+    catch {
+        for ($e = $_.Exception; $e; $e = $e.InnerException) {
+            if ($e -is [ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 1058) { return $false }
+        }
+        # Any other start problem is left to the deployment step, which reports its own error.
+        Write-Log "Could not start $($Name): $(Format-ErrorText $_.Exception.Message)" 'WARN' -Quiet
+        return $true
+    }
+}
+
+function Get-PolicyValue {
+    param([Parameter(Mandatory)][ValidateSet('LocalMachine', 'CurrentUser')][string] $Hive, [Parameter(Mandatory)][string] $Key, [Parameter(Mandatory)][string] $Name)
+    $root = if ($Hive -eq 'LocalMachine') { [Microsoft.Win32.Registry]::LocalMachine } else { [Microsoft.Win32.Registry]::CurrentUser }
+    $subKey = $root.OpenSubKey($Key)
+    if (-not $subKey) { return $null }
+    try { return $subKey.GetValue($Name) } finally { $subKey.Dispose() }
+}
+
+function Invoke-SystemReadiness {
+    # Checks the services and policies Microsoft Store depends on, and with -FixServices re-enables disabled services.
+    # Problems that do not stop the install become advisories. Returns $false when app installation cannot work.
+    param([AllowEmptyString()][string] $InstallationType)
+    $ready = $true
+    $problems = 0
+    $script:RestartRequired = $false
+    $restartAdvised = $false
+    foreach ($svc in $script:StoreServices) {
+        $start = Get-ServiceStartValue $svc.Name
+        if ($null -ne $start -and $start -ne 4) {
+            Write-Log "Service $($svc.Name): start type $start" -Quiet
+            # The registry can say Manual while Windows still treats the service as disabled (changed without a restart).
+            if ($svc.Required -and -not (Test-ServiceCanStart $svc.Name)) {
+                $problems++; $ready = $false; $script:RestartRequired = $true
+                Write-Log "Service $($svc.Name) is set to start type $start, but Windows refuses to start it until it restarts" 'WARN' -Quiet
+                Write-Item FAIL $svc.Title 'Windows treats it as disabled until it restarts'
+            }
+            continue
+        }
+        $problems++
+        $state = if ($null -eq $start) { 'missing from Windows' } else { 'disabled' }
+        if ($null -ne $start -and $FixServices) {
+            try {
+                $appliesNow = Set-ServiceManual $svc.Name
+                Write-Log "Service $($svc.Name) was disabled; set to Manual (-FixServices)$(if (-not $appliesNow) { ', after a restart' })" -Quiet
+                if ($appliesNow) { Write-Item OK $svc.Title 'was disabled, now Manual (starts when needed)'; continue }
+                if ($svc.Required) {
+                    # Installing now would fail with "The service cannot be started ... because it is disabled".
+                    $ready = $false; $script:RestartRequired = $true
+                    Write-Item FAIL $svc.Title 'set to Manual; Windows applies this when it restarts'
+                    continue
+                }
+                Write-Item OK $svc.Title 'was disabled, now Manual after Windows restarts'
+                $restartAdvised = $true
+                continue
+            }
+            catch {
+                $state = "disabled and could not be changed ($(Format-Brief $_.Exception.Message 120))"
+                Write-Log "Could not set $($svc.Name) to Manual: $(Format-ErrorText $_.Exception.Message)" 'WARN' -Quiet
+            }
+        }
+        Write-Log "Service $($svc.Name) ($($svc.Title)) is $state" 'WARN' -Quiet
+        if ($svc.Required) {
+            $ready = $false
+            Write-Item FAIL $svc.Title "$state; Windows needs it for $($svc.Use)"
+            continue
+        }
+        Write-Item WARN $svc.Title "$state; $($svc.Use) will not work"
+        $fix = if ($null -ne $start -and -not $FixServices) { ' Run the installer again with -FixServices to set it to Manual.' } else { '' }
+        $script:Advisories.Add("$($svc.Title) ($($svc.Name)) is $state, so $($svc.Use) will not work.$fix")
+    }
+    if ($problems -eq 0) { Write-Item OK 'Services' "all $(@($script:StoreServices).Count) services the Store uses are enabled" }
+    if ($restartAdvised -and $ready) { $script:Advisories.Add('Restart Windows after the install: Windows applies the re-enabled services when it starts.') }
+
+    $hives = @('LocalMachine') + @(if (-not $script:IsSystem) { 'CurrentUser' })
+    foreach ($policy in $script:StorePolicies) {
+        foreach ($hive in $hives) {
+            if ($hive -eq 'CurrentUser' -and -not $policy.UserToo) { continue }
+            $value = Get-PolicyValue -Hive $hive -Key $policy.Key -Name $policy.Name
+            if ($null -eq $value -or [string]$value -ne '1') { continue }
+            $where = '{0}\{1}\{2}' -f $(if ($hive -eq 'LocalMachine') { 'HKLM' } else { 'HKCU' }), $policy.Key, $policy.Name
+            Write-Log "Policy set: $where = 1" 'WARN' -Quiet
+            Write-Item WARN "Policy $($policy.Name)" $policy.Text
+            $script:Advisories.Add("A Group Policy $($policy.Text) ($where = 1). Remove it, or ask your administrator, then restart Windows.")
+        }
+    }
+    if ($InstallationType -eq 'Server') {
+        Write-Log 'Windows Server is not a tested target' 'WARN' -Quiet
+        Write-Item WARN 'Windows Server' 'not a tested target: Microsoft Store may not work'
+    }
+    return $ready
+}
+
+function Get-ClockOffset {
+    # Microsoft's time minus this PC's time, from the HTTP Date header of the Store catalog; $null when unavailable.
+    param([string] $Uri = 'https://displaycatalog.mp.microsoft.com/')
+    $response = $null
+    try {
+        $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Uri)
+        $request.Method = 'HEAD'
+        $request.Timeout = 15000
+        $request.AllowAutoRedirect = $false
+        try { $response = $request.GetResponse() }
+        catch {
+            # Any HTTP status will do: only the Date header matters.
+            $web = $_.Exception
+            while ($web -and $web -isnot [Net.WebException]) { $web = $web.InnerException }
+            if (-not $web -or -not $web.Response) { throw }
+            $response = $web.Response
+        }
+        $date = $response.Headers['Date']
+        if (-not $date) { return $null }
+        $server = [DateTime]::Parse($date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal')
+        return ($server - [DateTime]::UtcNow)
+    }
+    catch {
+        Write-Log "Clock check skipped: $(Format-ErrorText $_.Exception.Message)" -Quiet
+        return $null
+    }
+    finally { if ($response) { $response.Close() } }
+}
+
+function Test-Clock {
+    # Reports a Windows clock that is 5 or more minutes off. The downloads themselves do not depend on it: on
+    # 2026-11-24 the delivery service accepted requests from a clock 20 minutes fast and one day fast or slow. Sign-in
+    # and licenses can, so the user is told to fix the clock.
+    $offset = Get-ClockOffset
+    if ($null -eq $offset) { return }
+    Write-Log ('Clock: this PC differs from Microsoft by {0:N0} seconds' -f $offset.TotalSeconds) -Quiet
+    if ([Math]::Abs($offset.TotalMinutes) -lt 5) { return }
+    $minutes = [int][Math]::Round([Math]::Abs($offset.TotalMinutes))
+    $amount = if ($minutes -ge 120) { '{0:N0} hours' -f ($minutes / 60) } else { "$minutes minutes" }
+    $direction = if ($offset.TotalSeconds -gt 0) { 'slow' } else { 'fast' }
+    Write-Item WARN 'Windows clock' "$amount $direction"
+    $script:Advisories.Add("The Windows clock is $amount $direction. A wrong clock can break Store sign-in and app licenses: turn on 'Set time automatically', or run 'w32tm /resync' as administrator.")
+}
+
+function Get-DeploymentErrorCode {
+    # The HRESULT of a deployment error, such as "0x80073D06", so that decisions do not depend on the language of the
+    # Windows error text. Deployment errors start with "... HRESULT: 0x80073CF0, ..." in every language, and that first
+    # code is the deployment result; the exception's own HResult is often a mapped one (a "package could not be opened"
+    # error arrives as FileNotFoundException, 0x80070002), so it is only the fallback. $null when there is none.
+    param($ErrorRecord)
+    $exception = if ($ErrorRecord -is [Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    for ($e = $exception; $e; $e = $e.InnerException) {
+        if ([string]$e.Message -match '0x[0-9A-Fa-f]{8}') { return '0x' + $Matches[0].Substring(2).ToUpperInvariant() }
+    }
+    for ($e = $exception; $e; $e = $e.InnerException) {
+        $hr = [int]$e.HResult
+        # Facility 0x13 codes (0x8013xxxx) are generic .NET exception types, not a deployment result.
+        if ($hr -ne 0 -and (($hr -shr 16) -band 0x1FFF) -ne 0x13) { return ('0x{0:X8}' -f $hr) }
+    }
+    return $null
+}
+
+function Invoke-Winget {
+    # Runs winget through its App Execution Alias, the way a user would. Returns the exit code and output, or $null
+    # when this account has no winget alias. Throws when Windows refuses to start it (for example without a license).
+    param([string[]] $Arguments = @('--version'), [int] $TimeoutSeconds = 60)
+    $exe = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    # The alias appears shortly after registration.
+    for ($wait = 0; $wait -lt 10 -and -not (Test-Path -LiteralPath $exe); $wait++) { Start-Sleep -Seconds 1 }
+    if (-not (Test-Path -LiteralPath $exe)) { return $null }
+    $start = New-Object Diagnostics.ProcessStartInfo $exe
+    $start.Arguments = $Arguments -join ' '
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill() } catch { }
+            throw "winget did not finish within $TimeoutSeconds seconds"
+        }
+        $process.WaitForExit()
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = (($stdout.Result + ' ' + $stderr.Result) -replace '\s+', ' ').Trim() }
+    }
+    finally { $process.Dispose() }
+}
+
+function Test-WingetCommand {
+    # Registration does not prove that winget works: without its license Windows refuses to start it ("No applicable
+    # app licenses found"). Run it once, as the user would. Returns $true when it runs.
+    $problem = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        try {
+            $result = Invoke-Winget -Arguments '--version'
+            if (-not $result) { $problem = 'winget.exe is not available for this user' }
+            elseif ($result.ExitCode -eq 0 -and $result.Output -match 'v?\d+(\.\d+)+') {
+                Write-Log "winget runs: $($result.Output)" -Quiet
+                Write-Item OK "winget $($Matches[0]) runs"
+                return $true
+            }
+            else { $problem = ('winget exited with code 0x{0:X8}: {1}' -f $result.ExitCode, $result.Output) }
+        }
+        catch { $problem = Format-ErrorText $_.Exception.Message }
+        if ($attempt -eq 1) { Start-Sleep -Seconds 3 }
+    }
+    Write-Log "winget does not run: $problem" 'WARN' -Quiet
+    Write-Item WARN 'winget does not run yet' (Format-Brief $problem 200)
+    # A missing license was already counted as a failure; do not count its consequence again.
+    if (-not $script:WingetLicenseMissing) { Add-Failure "winget does not run: $(Format-Brief $problem 120)" }
+    return $false
+}
+# endregion
+
+# region Diagnostics bundle (-CollectLogs)
+function Protect-DiagnosticText {
+    # Removes user, computer and domain names and account SIDs, so the bundle can go on a public issue. The collected
+    # logs and events can come from other accounts too (a shared offline folder, another user's install), so besides
+    # the collecting account's own names it replaces every profile folder name under \Users\ and the account and
+    # computer recorded in an installer log, whoever they belong to.
+    param([AllowNull()][AllowEmptyString()][string] $Text)
+    if (-not $Text) { return $Text }
+    $Text = [regex]::Replace($Text, 'S-1-5-21-\d+-\d+-\d+-\d+', '<sid>')
+    # Paths first, whole names only. Replacing a name inside a path first would cut it apart: with a profile of
+    # C:\Users\Jane, the folder of another account, C:\Users\Jane Smith, would become "%USERPROFILE% Smith" or
+    # "\Users\<user> Smith" and keep "Smith" (CodeRabbit review, PR #8).
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, Multiline'
+    # 1. This account's profile path, only where it ends: followed by a backslash, a quote or the end of the line.
+    if ($env:USERPROFILE -and $env:USERPROFILE.Length -ge 4) {
+        $Text = [regex]::Replace($Text, [regex]::Escape($env:USERPROFILE.TrimEnd('\')) + '(?=\\|[\r\n"''<>|]|$)', '%USERPROFILE%', $options)
+    }
+    # 2. Any other profile folder. Windows' shared profile folders name no one and are kept, but only as a whole folder
+    #    name: "Public Smith" is an account. A profile name may contain spaces, so a name at the end of a path, where
+    #    nothing marks its end, is replaced up to the end of the line or a quote: that can hide a little of the text
+    #    after it, but never leaves part of a name behind.
+    $chars = '[^\\\r\n"''<>|*?:]'
+    $shared = '(?:Public|Default|Default User|All Users)'
+    $Text = [regex]::Replace($Text, '(?<=\\Users\\)(?!' + $shared + '\\)' + $chars + '+(?=\\)', '<user>', $options)
+    $Text = [regex]::Replace($Text, '(?<=\\Users\\)(?!' + $chars + '*\\)(?!' + $shared + '(?:[\r\n"''<>|]|$))(?!<user>)' + $chars + '+', '<user>', $options)
+    # 3. This account's user, computer and domain names elsewhere in the text.
+    foreach ($pair in @(@($env:USERNAME, '<user>'), @($env:COMPUTERNAME, '<computer>'), @($env:USERDOMAIN, '<domain>'))) {
+        if (-not $pair[0] -or $pair[0].Length -lt 2) { continue }
+        $Text = [regex]::Replace($Text, '(?<![\w-])' + [regex]::Escape($pair[0]) + '(?![\w-])', $pair[1], 'IgnoreCase')
+    }
+    # The account and computer an installer log recorded, which may be another user's or another PC's.
+    $Text = [regex]::Replace($Text, '(?m)^(\[[^\]\r\n]*\] \[\w+\] User\s*: )[^\r\n(]*?(\s*\(SYSTEM[^\r\n]*)?(\r?)$', '$1<domain>\<user>$2$3')
+    $Text = [regex]::Replace($Text, '(?m)^(\[[^\]\r\n]*\] \[\w+\] Computer\s*: )[^\r\n]*?(\r?)$', '$1<computer>$2')
+    return $Text
+}
+
+function Test-Endpoint {
+    # One line about whether an HTTPS host answers: any HTTP status counts as reachable.
+    param([Parameter(Mandatory)][string] $Uri)
+    $response = $null
+    try {
+        $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Uri)
+        $request.Method = 'HEAD'; $request.Timeout = 15000; $request.AllowAutoRedirect = $false
+        try { $response = $request.GetResponse() }
+        catch {
+            $web = $_.Exception
+            while ($web -and $web -isnot [Net.WebException]) { $web = $web.InnerException }
+            if (-not $web -or -not $web.Response) { throw }
+            $response = $web.Response
+        }
+        return "reachable (HTTP $([int]$response.StatusCode))"
+    }
+    catch { return "FAILED: $(Format-ErrorText $_.Exception.Message)" }
+    finally { if ($response) { $response.Close() } }
+}
+
+function Save-Diagnostics {
+    # Writes a zip with what a bug report needs and returns the exit code. Each part is collected on its own, so one
+    # that fails (no admin rights, a missing event log) is noted in the bundle instead of stopping it.
+    param([Parameter(Mandatory)] $OsInfo, [Parameter(Mandatory)][string] $OsName, [Parameter(Mandatory)][int] $Build, [int] $Revision)
+    $stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
+    $staging = Join-Path ([IO.Path]::GetTempPath()) ('Store-LTSC-diagnostics-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $staging
+    $elevated = Test-IsElevated
+    $packageNames = @('Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.XboxIdentityProvider', 'Microsoft.DesktopAppInstaller', 'Microsoft.VCLibs*', 'Microsoft.UI.Xaml*', 'Microsoft.NET.Native*', 'Microsoft.WindowsAppRuntime*', 'Microsoft.Services.Store.Engagement')
+    $parts = [ordered]@{
+        'system.txt'       = {
+            $info = [ordered]@{
+                'Store-LTSC version' = $script:Version
+                'Windows'            = "$OsName (build $Build.$Revision)"
+                'EditionID'          = $(if ($OsInfo.PSObject.Properties['EditionID']) { $OsInfo.EditionID })
+                'InstallationType'   = $(if ($OsInfo.PSObject.Properties['InstallationType']) { $OsInfo.InstallationType })
+                'Architecture'       = Get-OsArch
+                'PowerShell'         = "$($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition), $([IntPtr]::Size * 8)-bit"
+                'Language mode'      = [string]$ExecutionContext.SessionState.LanguageMode
+                'Elevated'           = $elevated
+                'Running as SYSTEM'  = Test-IsSystemAccount
+                'UI culture'         = [string](Get-UICulture).Name
+                'Local time'         = (Get-Date).ToString('o')
+                'UTC time'           = [DateTime]::UtcNow.ToString('o')
+            }
+            $offset = Get-ClockOffset
+            $info['Clock vs Microsoft'] = if ($null -ne $offset) { '{0:N0} seconds' -f $offset.TotalSeconds } else { 'unknown' }
+            foreach ($host_ in @('https://displaycatalog.mp.microsoft.com/', 'https://fe3.delivery.mp.microsoft.com/', 'https://api.github.com/', 'https://github.com/')) { $info["Network $host_"] = Test-Endpoint $host_ }
+            $info.GetEnumerator() | ForEach-Object { '{0,-40} {1}' -f $_.Key, $_.Value }
+        }
+        'services.txt'     = {
+            foreach ($svc in $script:StoreServices) {
+                $start = Get-ServiceStartValue $svc.Name
+                $startText = if ($null -eq $start) { 'missing' } else { switch ($start) { 2 { 'Automatic' } 3 { 'Manual' } 4 { 'DISABLED' } default { "Start=$start" } } }
+                $status = try { [string](Get-Service -Name $svc.Name -ErrorAction Stop).Status } catch { 'unknown' }
+                '{0,-16} {1,-34} {2,-10} {3}' -f $svc.Name, $svc.Title, $startText, $status
+            }
+        }
+        'policies.txt'     = {
+            foreach ($policy in $script:StorePolicies) {
+                foreach ($hive in 'LocalMachine', 'CurrentUser') {
+                    $value = Get-PolicyValue -Hive $hive -Key $policy.Key -Name $policy.Name
+                    '{0}\{1}\{2} = {3}' -f $(if ($hive -eq 'LocalMachine') { 'HKLM' } else { 'HKCU' }), $policy.Key, $policy.Name, $(if ($null -eq $value) { '(not set)' } else { $value })
+                }
+            }
+        }
+        'packages-current-user.txt' = {
+            $packageNames | ForEach-Object { Get-AppxPackage -Name $_ -ErrorAction Stop } | Sort-Object Name, Version |
+                Format-Table Name, Version, Architecture, Status, IsFramework, SignatureKind -AutoSize | Out-String -Width 250
+        }
+        'packages-all-users.txt' = {
+            if (-not $elevated) { 'Needs administrator rights.'; return }
+            # Per-user detail is summarised by state: other accounts' names stay out of the bundle.
+            $packageNames | ForEach-Object { Get-AppxPackage -AllUsers -Name $_ -ErrorAction Stop } | Sort-Object Name, Version | ForEach-Object {
+                $states = @($_.PackageUserInformation | Group-Object { [string]$_.InstallState } | ForEach-Object { '{0} x{1}' -f $_.Name, $_.Count }) -join ', '
+                '{0,-50} {1,-18} {2,-8} {3}' -f $_.Name, $_.Version, $_.Architecture, $states
+            }
+        }
+        'packages-provisioned.txt' = {
+            if (-not $elevated) { 'Needs administrator rights.'; return }
+            Get-AppxProvisionedPackage -Online -ErrorAction Stop | Sort-Object DisplayName | ForEach-Object { '{0,-50} {1,-18} {2}' -f $_.DisplayName, $_.Version, $_.PackageName }
+        }
+        'winget.txt'       = {
+            $result = Invoke-Winget -Arguments '--version' -TimeoutSeconds 30
+            if (-not $result) { 'winget.exe is not available for this user' } else { "exit code: 0x{0:X8}`r`noutput: {1}" -f $result.ExitCode, $result.Output }
+        }
+        'events-appx-deployment.txt' = {
+            $filter = @{ LogName = 'Microsoft-Windows-AppXDeploymentServer/Operational'; Level = 1, 2, 3; StartTime = (Get-Date).AddDays(-7) }
+            Get-WinEvent -FilterHashtable $filter -MaxEvents 200 -ErrorAction Stop | ForEach-Object {
+                '[{0:yyyy-MM-dd HH:mm:ss}] {1} {2}: {3}' -f $_.TimeCreated, $_.LevelDisplayName, $_.Id, (($_.Message -replace '\s+', ' ').Trim())
+            }
+        }
+    }
+    Write-Host ''
+    Write-Host '  Collecting diagnostics for a bug report' -ForegroundColor Cyan
+    # One try/finally around everything that writes to the staging folder, so no failure leaves it behind.
+    try {
+        foreach ($part in $parts.GetEnumerator()) {
+            Show-Activity -Text 'Collecting diagnostics' -Detail $part.Key
+            $text = try { (& $part.Value | Out-String -Width 250) } catch { "Unavailable: $(Format-ErrorText $_.Exception.Message)" }
+            if (-not $text.Trim()) { $text = '(nothing found)' }
+            Set-Content -LiteralPath (Join-Path $staging $part.Key) -Value (Protect-DiagnosticText $text) -Encoding UTF8
+            Write-StatusLine 'OK' $part.Key
+        }
+        # The newest installer logs from every place a run writes them. A log that cannot be read (another run still
+        # writing it, no permission) is noted in the bundle instead of stopping the collection.
+        $logDirs = @((Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs'), $LogDir, $(if ($WorkDir) { Join-Path $WorkDir 'Logs' })) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+        $logs = @($logDirs | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter 'StoreInstall-*.log' -File -ErrorAction SilentlyContinue } | Sort-Object LastWriteTime -Descending | Select-Object -First 5)
+        $copied = 0
+        if ($logs.Count -gt 0) {
+            $null = New-Item -ItemType Directory -Path (Join-Path $staging 'logs')
+            foreach ($log in $logs) {
+                try { $text = Get-Content -LiteralPath $log.FullName -Raw -ErrorAction Stop; $copied++ }
+                catch { $text = "Unreadable: $(Format-ErrorText $_.Exception.Message)" }
+                Set-Content -LiteralPath (Join-Path $staging "logs\$($log.Name)") -Value (Protect-DiagnosticText $text) -Encoding UTF8
+            }
+        }
+        Write-StatusLine $(if ($copied -eq $logs.Count) { 'OK' } else { 'WARN' }) "installer logs: $copied$(if ($copied -lt $logs.Count) { " of $($logs.Count) readable" })"
+        Clear-LiveLine
+
+        # -LogDir only when the user gave it: a relaunch does not fill it in for -CollectLogs (Invoke-Relaunch).
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $outDir = if ($LogDir) { $LogDir } elseif ($desktop -and -not (Test-IsSystemAccount) -and (Test-Path -LiteralPath $desktop -PathType Container)) { $desktop } else { Join-Path ([IO.Path]::GetTempPath()) 'StoreInstall-Logs' }
+        if (-not (Test-Path -LiteralPath $outDir -PathType Container)) { $null = New-Item -ItemType Directory -Path $outDir -Force }
+        $zip = Join-Path $outDir "Store-LTSC-diagnostics-$stamp.zip"
+        Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
+    }
+    catch {
+        Clear-LiveLine
+        Write-StatusLine 'FAIL' "Could not save the diagnostics: $(Format-ErrorText $_.Exception.Message)"
+        return 7
+    }
+    finally { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host ''
+    Write-Host "  Diagnostics saved: $zip" -ForegroundColor Green
+    Write-Host '  User, computer and domain names are replaced with placeholders. Look through the files, then attach' -ForegroundColor DarkGray
+    Write-Host '  the zip to an issue: https://github.com/Softhe/Store-LTSC/issues/new/choose' -ForegroundColor DarkGray
+    if (-not $elevated) { Write-Host '  Without administrator rights, the all-users and provisioned package lists are missing.' -ForegroundColor Yellow }
+    Write-Host ''
+    $script:Completed = $true
+    Restore-Console
+    return 0
+}
+# endregion
+
 # region Online download (Microsoft Store delivery service)
 $script:Fe3Url = 'https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx'
 $script:WuNs = 'http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService'
@@ -1260,16 +1805,31 @@ function Initialize-Network {
     if ($proxy) { $proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials }
 }
 
+function Test-PermanentWebError {
+    # An HTTP client error (4xx, except 408 Request Timeout and 429 Too Many Requests) gives the same answer on a retry.
+    param($Exception)
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        if (-not $e.PSObject.Properties['Response'] -or -not $e.Response -or -not $e.Response.PSObject.Properties['StatusCode']) { continue }
+        $status = [int]$e.Response.StatusCode
+        return ($status -ge 400 -and $status -lt 500 -and @(408, 429) -notcontains $status)
+    }
+    return $false
+}
+
 function Invoke-WithRetry {
+    # Retries timeouts, connection failures and server errors. A permanent HTTP client error fails at once, unless
+    # -RetryAll is given (package downloads: each attempt asks for a fresh download address).
     param(
         [Parameter(Mandatory)][scriptblock] $Action,
         [Parameter(Mandatory)][string] $What,
-        [int] $Attempts = 3
+        [int] $Attempts = 3,
+        [switch] $RetryAll
     )
     for ($i = 1; ; $i++) {
         try { return (& $Action) }
         catch {
             if ($i -ge $Attempts) { throw "$What failed after $Attempts attempts: $($_.Exception.Message)" }
+            if (-not $RetryAll -and (Test-PermanentWebError $_.Exception)) { throw "$What failed: $($_.Exception.Message)" }
             Write-Log "$What failed (attempt $i/$Attempts): $($_.Exception.Message); retrying" 'WARN'
             Start-Sleep -Seconds (5 * $i)
         }
@@ -1583,7 +2143,7 @@ function Save-OnlinePackage {
         Show-Activity -Text $title -Fraction $(if ($p.Size -gt 0) { $received / $p.Size } else { -1 }) -Detail $detail
     }
     try {
-        $null = Invoke-WithRetry -What "Download of $($p.Moniker)" -Action {
+        $null = Invoke-WithRetry -What "Download of $($p.Moniker)" -RetryAll -Action {
             # URLs are short-lived; request a fresh one per attempt.
             Show-Activity -Text $title -Detail 'connecting'
             $url = Get-Fe3FileUrl -Package $p -DeviceAttributes $DeviceAttributes
@@ -1613,9 +2173,14 @@ function Save-OnlinePackages {
         [Parameter(Mandatory)][string[]] $Families,
         [Parameter(Mandatory)][string] $OsArch,
         [Parameter(Mandatory)][int] $Build,
-        [int] $Revision = 0
+        [int] $Revision = 0,
+        # Download-only: the folder must hold every framework the apps declare, so one the service does not offer is a
+        # failure. An install can still use a framework the PC already has.
+        [switch] $RequireComplete
     )
     Initialize-Network
+    Show-Activity -Text 'Microsoft Store catalog' -Detail 'checking the clock'
+    Test-Clock
     Show-Activity -Text 'Microsoft Store catalog' -Detail 'connecting'
     $attrs = Get-Fe3DeviceAttributes -OsArch $OsArch -Build $Build
     $cookie = Get-Fe3Cookie
@@ -1709,11 +2274,22 @@ function Save-OnlinePackages {
     # The service offers frameworks for every app version. Download only the frameworks the chosen apps'
     # manifests declare (and what those frameworks declare in turn).
     $neededFw = New-Object System.Collections.Generic.List[object]
+    # Declared frameworks the service does not offer (name, minimum version, architecture). Installing can still work
+    # when the PC already has them; an offline folder (-RequireComplete) is incomplete without them.
+    $unsatisfied = [ordered]@{}
     while ($pendingManifests.Count -gt 0) {
         $item = $pendingManifests.Dequeue()
         foreach ($dep in $item.Metadata.Dependencies) {
             $expectedFamily = if ($dep.Publisher) { $dep.Name + '_' + (Get-PublisherId $dep.Publisher) } else { $null }
             $matching = @($fwPkgs | Where-Object { $_.Identity.Name -eq $dep.Name -and (-not $expectedFamily -or $_.Identity.Family -eq $expectedFamily) -and ($_.Identity.Arch -eq 'neutral' -or $_.Identity.Arch -eq $dep.Arch) -and $_.Identity.Version -ge $dep.MinVersion })
+            if ($matching.Count -eq 0) {
+                $key = '{0} {1} or newer ({2})' -f $dep.Name, $dep.MinVersion, $dep.Arch
+                if (-not $unsatisfied.Contains($key)) {
+                    $unsatisfied[$key] = $true
+                    Write-Log "The service offers no package for $key, which $($item.Package.Identity.Name) declares" 'WARN' -Quiet:(-not $RequireComplete)
+                    if ($RequireComplete) { Add-Failure "Framework not offered: $key" }
+                }
+            }
             foreach ($fw in $matching) {
                 if ($neededFw.Contains($fw)) { continue }
                 $neededFw.Add($fw)
@@ -1737,6 +2313,7 @@ function Save-OnlinePackages {
         Build = $Build
         RequestedFamilies = @($Families)
         MissingFamilies = @($missing)
+        MissingDependencies = @($unsatisfied.Keys)
         Files = @($downloaded | ForEach-Object {
             # The published SHA-256 was just verified against the file; hash again only when the service gave SHA-1.
             $sha256 = if ($hashes[$_.Name]) { [BitConverter]::ToString([Convert]::FromBase64String($hashes[$_.Name])) -replace '-', '' } else { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
@@ -1765,6 +2342,22 @@ try {
         Write-StatusLine 'FAIL' '-DownloadOnly cannot be combined with -Source Local.'
         return 7
     }
+    if (($TargetBuild -or $TargetArch) -and -not $DownloadOnly) {
+        Write-StatusLine 'FAIL' '-TargetBuild and -TargetArch only work with -DownloadOnly.'
+        return 7
+    }
+    if ($TargetArch -and @('x64', 'arm64', 'x86') -notcontains $TargetArch) {
+        Write-StatusLine 'FAIL' "-TargetArch must be x64, arm64 or x86, not '$TargetArch'."
+        return 7
+    }
+    if ($TargetBuild -and $TargetBuild -lt 10240) {
+        Write-StatusLine 'FAIL' "-TargetBuild must be a Windows 10 or 11 build number such as 19044, not $TargetBuild."
+        return 7
+    }
+    if ($CollectLogs -and ($DownloadOnly -or $FixServices)) {
+        Write-StatusLine 'FAIL' '-CollectLogs installs nothing and cannot be combined with -DownloadOnly or -FixServices.'
+        return 7
+    }
 
     # Resolve paths before any relaunch, which may start in another directory.
     # WorkDir is empty when run via irm | iex; local packages then come from the current folder only with -Source Local.
@@ -1773,15 +2366,23 @@ try {
     $LogDir = Resolve-UserPath $LogDir
     $DownloadDir = Resolve-UserPath $DownloadDir
 
+    # -CollectLogs asks for administrator rights too (they show the provisioned packages), but works without them.
     if (-not $DownloadOnly -and -not (Test-IsElevated)) {
         if (-not (Test-CanPromptForElevation)) {
-            Write-StatusLine 'FAIL' 'Run this script as Administrator.'
-            return 1
+            if (-not $CollectLogs) {
+                Write-StatusLine 'FAIL' 'Run this script as Administrator.'
+                return 1
+            }
         }
-        try { return (Invoke-Relaunch -Elevate) }
-        catch {
-            Write-StatusLine 'FAIL' "Administrator rights are required ($($_.Exception.Message))."
-            return 1
+        else {
+            try { return (Invoke-Relaunch -Elevate) }
+            catch {
+                if (-not $CollectLogs) {
+                    Write-StatusLine 'FAIL' "Administrator rights are required ($($_.Exception.Message))."
+                    return 1
+                }
+                Write-StatusLine 'WARN' 'Collecting without administrator rights; some package lists will be missing.'
+            }
         }
     }
 
@@ -1804,6 +2405,8 @@ try {
     $osName = if ($osVersionInfo.PSObject.Properties['ProductName']) { [string]$osVersionInfo.ProductName } else { 'Windows' }
     if ($build -ge 22000) { $osName = $osName -replace '^Windows 10', 'Windows 11' }
     if ($osVersionInfo.PSObject.Properties['DisplayVersion'] -and $osVersionInfo.DisplayVersion) { $osName += ", $($osVersionInfo.DisplayVersion)" }
+    # Diagnostics work on any build, including the unsupported ones people report problems from.
+    if ($CollectLogs) { return (Save-Diagnostics -OsInfo $osVersionInfo -OsName $osName -Build $build -Revision $revision) }
     if (-not $DownloadOnly -and $build -lt 19041) {
         Write-StatusLine 'FAIL' "Windows build 19041 or later is required (this is build $build)."
         return 2
@@ -1847,6 +2450,10 @@ try {
     }
 
     $osArch = Get-OsArch
+    # A download for another machine (-TargetBuild/-TargetArch) picks packages for that machine instead.
+    $pkgArch = if ($TargetArch) { $TargetArch } else { $osArch }
+    $pkgBuild = if ($TargetBuild) { $TargetBuild } else { $build }
+    $pkgRevision = if ($TargetBuild) { 0 } else { $revision }
     $extensions = @('.appx', '.msix', '.appxbundle', '.msixbundle')
     $localPkgs = @(if ($WorkDir) {
             Get-ChildItem -LiteralPath $WorkDir -File |
@@ -1867,12 +2474,15 @@ try {
     $script:IsOnline = $online
 
     Write-Log '==== Microsoft Store unattended install starting ====' -Quiet
+    Write-Log "Version   : Store-LTSC $script:Version" -Quiet
     Write-Log "Work dir  : $(if ($WorkDir) { $WorkDir } else { '(none)' })" -Quiet
     Write-Log "Log file  : $(if ($script:LogFile) { $script:LogFile } else { '(console only)' })" -Quiet
     Write-Log "User      : $env:USERDOMAIN\$env:USERNAME$(if ($script:IsSystem) { ' (SYSTEM: provisioning only)' })" -Quiet
     Write-Log "Computer  : $env:COMPUTERNAME" -Quiet
     Write-Log "Build     : $build.$revision" -Quiet
     Write-Log "OS arch   : $osArch (PROCESSOR_ARCHITECTURE=$($env:PROCESSOR_ARCHITECTURE), W6432=$($env:PROCESSOR_ARCHITEW6432))" -Quiet
+    if ($TargetBuild -or $TargetArch) { Write-Log "Target    : build $pkgBuild, $pkgArch (packages for another machine)" -Quiet }
+    if ($FixServices) { Write-Log 'FixServices: True' -Quiet }
     Write-Log "Source    : $(if ($online) { 'Online (Microsoft Store delivery service)' } else { 'Local (work dir)' })$(if ($Source -eq 'Auto') { ' [auto]' })" -Quiet
     Write-Log "Provision : $($script:DoProvision -and -not $DownloadOnly)" -Quiet
     Write-Log "SkipWinget: $([bool]$SkipWinget)" -Quiet
@@ -1882,7 +2492,7 @@ try {
     $families = @($script:StoreFamily) + $script:OptionalFamilies
     if (-not $SkipWinget) { $families += $script:WingetFamily }
 
-    $title = 'Microsoft Store installer for Windows LTSC'
+    $title = "Microsoft Store installer for Windows LTSC $script:Version"
     Write-Host ''
     Write-Host "  $title" -ForegroundColor Cyan
     Write-Host ('  ' + ($script:Glyph.Rule * $title.Length)) -ForegroundColor DarkCyan
@@ -1892,16 +2502,29 @@ try {
         else { 'This user and new users' }
     foreach ($field in @(
             @('Windows', "$osName (build $build.$revision, $osArch)"),
+            $(if ($TargetBuild -or $TargetArch) { ,@('Target', "build $pkgBuild, $pkgArch (packages for another machine)") }),
             @('Account', "$env:USERDOMAIN\$env:USERNAME"),
             @('Source', $(if ($online) { 'Microsoft Store delivery service (online)' } else { "Local folder: $WorkDir" })),
             @('Install', $mode),
             @('Apps', (($families | ForEach-Object { $script:AppTitles[$_ -replace '_.*$'] }) -join ', ')),
             @('Log', $(if ($script:LogFile) { $script:LogFile } else { '(console only)' })))) {
+        if (-not $field) { continue }   # the Target line is only there for a download for another machine
         Write-Parts @(@(('    {0,-10}' -f $field[0]), 'DarkGray'), @($field[1], $null))
     }
-    # Sections are numbered: get the packages, install frameworks, install apps, verify.
+    # Sections are numbered: check Windows, get the packages, install frameworks, install apps, verify.
     $script:StepNumber = 0
-    $script:StepTotal = if ($DownloadOnly) { 1 } else { 4 }
+    $script:StepTotal = if ($DownloadOnly) { 1 } else { 5 }
+
+    if (-not $DownloadOnly) {
+        Write-Section 'Checking Windows'
+        $installationType = if ($osVersionInfo.PSObject.Properties['InstallationType']) { [string]$osVersionInfo.InstallationType } else { '' }
+        if (-not (Invoke-SystemReadiness -InstallationType $installationType)) {
+            $fixHint = if ($script:RestartRequired) { 'Restart Windows, then run the installer again.' }
+                elseif ($FixServices) { 'A required service could not be re-enabled. Set it to Manual in services.msc, restart Windows and run the installer again.' }
+                else { 'Run the installer again with -FixServices to set the disabled services to Manual.' }
+            return (Complete-Run 9 'Windows is not ready for app installation' $fixHint)
+        }
+    }
 
     if ($online) {
         if ($DownloadDir) {
@@ -1920,12 +2543,12 @@ try {
 
         Write-Section 'Downloading packages from Microsoft'
         try {
-            $all = @(Save-OnlinePackages -Destination $pkgDir -Families $families -OsArch $osArch -Build $build -Revision $revision)
+            $all = @(Save-OnlinePackages -Destination $pkgDir -Families $families -OsArch $pkgArch -Build $pkgBuild -Revision $pkgRevision -RequireComplete:$DownloadOnly)
         }
         catch {
             Clear-LiveLine
             Write-Log "Download FAILED: $($_.Exception.Message)" 'ERROR'
-            Write-Log 'Check internet access to displaycatalog.mp.microsoft.com, fe3.delivery.mp.microsoft.com and *.dl.delivery.mp.microsoft.com (proxy/firewall).' 'ERROR'
+            Write-Log 'Check internet access to displaycatalog.mp.microsoft.com, fe3.delivery.mp.microsoft.com and *.dl.delivery.mp.microsoft.com (proxy/firewall), and that the Windows clock and time zone are right.' 'ERROR'
             return (Complete-Run 8 'Download failed')
         }
 
@@ -2126,20 +2749,24 @@ $global:LASTEXITCODE = $StoreLtscExitCode
 # An outer param block would bind variables in the caller's scope under Invoke-Expression.
 # Convert supported named arguments to a splat inside this private child scope instead.
 $forward = @{}
-$stringParameters = @('WorkDir', 'LogDir', 'Source', 'DownloadDir', 'DownloadTimeoutSeconds', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable')
-$switchParameters = @('DownloadOnly', 'KeepDownloads', 'NoProvision', 'SkipWinget', 'PauseAtEnd', 'Verbose', 'Debug')
+$stringParameters = @('WorkDir', 'LogDir', 'Source', 'DownloadDir', 'DownloadTimeoutSeconds', 'TargetBuild', 'TargetArch', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable')
+$switchParameters = @('DownloadOnly', 'KeepDownloads', 'NoProvision', 'SkipWinget', 'FixServices', 'CollectLogs', 'PauseAtEnd', 'Verbose', 'Debug')
 try {
 if (@($InvocationArguments | Where-Object { @('-?', '/?', '-h', '-help', '--help') -contains [string]$_ }).Count -gt 0) {
     foreach ($helpLine in @(
             '',
-            '  Microsoft Store installer for Windows LTSC',
+            "  Microsoft Store installer for Windows LTSC $StoreLtscVersion",
             '',
             '  Install:    irm https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1 | iex',
             '  Options:    & ([scriptblock]::Create((irm <same url>))) -SkipWinget',
             '',
             '    -SkipWinget                   Skip App Installer and winget.',
             '    -NoProvision                  Install for the current user only.',
+            '    -FixServices                  Set disabled services the Store needs back to Manual.',
+            '    -CollectLogs                  Install nothing; save a diagnostics zip for a bug report.',
             '    -DownloadOnly                 Download the packages without installing them.',
+            '    -TargetBuild <n>              With -DownloadOnly: packages for this Windows build (e.g. 19044).',
+            '    -TargetArch x64|arm64|x86     With -DownloadOnly: packages for this architecture.',
             '    -DownloadDir <folder>         Save downloads here and keep them.',
             '    -KeepDownloads                Keep the temporary download folder.',
             '    -Source Online|Local|Auto     Download from Microsoft, use -WorkDir, or decide automatically.',
@@ -2148,7 +2775,8 @@ if (@($InvocationArguments | Where-Object { @('-?', '/?', '-h', '-help', '--help
             '    -DownloadTimeoutSeconds <n>   Time limit for one package download (default 1800).',
             '',
             '  Exit codes: 0 success, 1 not elevated, 2 unsupported Windows build, 3 language mode, 4 package missing',
-            '              or invalid, 5 partial failure, 6 Store not installed, 7 fatal or invalid option, 8 download failed.',
+            '              or invalid, 5 partial failure, 6 Store not installed, 7 fatal or invalid option, 8 download failed,',
+            '              9 a service that app installation needs is disabled.',
             ''
         )) { Write-Host $helpLine }
     if ($OriginalScriptPath) { exit 0 }

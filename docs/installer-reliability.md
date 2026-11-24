@@ -10,6 +10,8 @@ Each default download folder has a unique name under the temporary directory. Th
 
 `-DownloadTimeoutSeconds` limits each package download attempt. The default is 1800 seconds, and the accepted range is 1 through 86400 seconds. The downloader stops a transfer that exceeds this limit, or that receives no data for 60 seconds. Metadata requests have separate timeouts. Retries mean the total run can take longer than one download deadline.
 
+Catalog lookups, delivery service requests and the GitHub license lookup are retried after timeouts, connection failures, HTTP 408, HTTP 429 and server errors. A permanent HTTP client error, such as 404, fails at once instead of waiting for further attempts. Package downloads retry every error, because each attempt asks the service for a fresh download address. When the GitHub API refuses the winget license lookup, for example after the 60 unauthenticated requests per hour that it allows per address, the script finds the license file on the release page instead.
+
 Downloads use one unique temporary file per package. A retry resumes that file with an HTTP range request. The script checks the service-provided hash and Microsoft signature before replacing the destination package, and discards a file that fails or cannot complete verification. The temporary file is removed when the package succeeds or the retries are exhausted. The transfer is read in small blocks, so Ctrl+C is answered promptly. An interrupted run still removes its own temporary download folder.
 
 ## Windows versions
@@ -70,7 +72,7 @@ Verification then decides the result. It checks current-user registration status
 
 ## Exit codes
 
-Existing exit codes remain in use. Code 4 also covers invalid or incompatible package metadata and missing dependencies. Code 5 means a requested app or deployment step failed, or verification could not confirm a companion app or a new-user dependency. It also covers an incomplete download-only set. Code 6 also covers a Store that is not registered after installation. Code 7 covers invalid offline manifests and other fatal errors. Code 8 covers online lookup, transfer, and verification failures for required downloads.
+Code 9 means AppX Deployment Service or State Repository Service is disabled or missing, or Windows applies its new start type only after a restart. The run stops after the Windows check, before it downloads or installs anything. Existing exit codes remain in use. Code 4 also covers invalid or incompatible package metadata and missing dependencies. Code 5 means a requested app or deployment step failed, or verification could not confirm a companion app or a new-user dependency. It also covers an incomplete download-only set. Code 6 also covers a Store that is not registered after installation. Code 7 covers invalid offline manifests and other fatal errors. Code 8 covers online lookup, transfer, and verification failures for required downloads.
 
 ## Validation
 
@@ -81,6 +83,20 @@ powershell.exe -NoProfile -NonInteractive -File .\tests\Run-Tests.ps1
 pwsh.exe -NoProfile -NonInteractive -File .\tests\Run-Tests.ps1
 ```
 
-The tests use the installer's actual functions and main orchestration with fixture packages and mocked deployment calls. They cover caller scope, relaunch snapshots and arguments, relative path resolution, the command launcher's `-Source` default, cleanup ownership, package selection, dependencies, superseded frameworks, post-install verification, offline manifests, incomplete requested sets, and cancellation of a stalled loopback HTTP transfer. GitHub Actions runs the suite under both PowerShell engines.
+The tests use the installer's actual functions and main orchestration with fixture packages and mocked deployment calls. They cover caller scope, relaunch snapshots and arguments, relative path resolution, the command launcher's `-Source` default, cleanup ownership, package selection, dependencies, superseded frameworks, post-install verification, offline manifests, incomplete requested sets, and cancellation of a stalled loopback HTTP transfer. They also cover the Windows readiness checks and `-FixServices`, localized deployment error codes, which HTTP errors are retried, the winget run check, diagnostics redaction and invalid option combinations. GitHub Actions runs the suite under both PowerShell engines.
+
+### Daily live check
+
+The regression tests mock Microsoft's delivery service. The [live catalog check](../.github/workflows/live-catalog.yml) runs the real `-DownloadOnly` every day for LTSC 2021 x64 (build 19044), LTSC 2024 x64 and LTSC 2024 ARM64 (build 26100). It uses `-TargetBuild` and `-TargetArch`, because the runner itself is Windows Server. Each job checks that all four apps and the winget license arrived, and lists the packages in the job summary. A failed scheduled run opens an issue named "Live catalog check is failing", or adds a comment to it if it is already open. GitHub turns off scheduled workflows in a repository with no activity for 60 days. If that happens, turn the workflow back on from the Actions tab.
+
+### Releases
+
+A release is a tag `v<version>` that matches `$StoreLtscVersion` in `install.ps1`. Before tagging:
+
+1. Set `$StoreLtscVersion` in `install.ps1`.
+2. Add a `## [<version>] - <date>` section to `CHANGELOG.md`. The release workflow rejects a section marked `Unreleased`.
+3. Merge to `main`, then tag and push: `git tag v1.0.0 && git push origin v1.0.0`.
+
+The [release workflow](../.github/workflows/release.yml) runs the tests under both engines, checks the tag against the script version, and publishes `install.ps1`, `Install-Store.cmd` and `SHA256SUMS.txt`. The release notes include the pinned one-line command. It publishes from Linux, so the files keep the repository's line endings and their hashes match the files served from `raw.githubusercontent.com/Softhe/Store-LTSC/<tag>/`.
 
 These tests do not install packages or exercise UAC. They do not prove that Microsoft's live delivery service offers an installable package set for a particular LTSC image. Before release, test online and offline installation on disposable LTSC 2021 and LTSC 2024 systems, including SYSTEM provisioning and a new user's first sign-in. Check that Microsoft Store opens, winget runs, and the expected packages register for the intended users.

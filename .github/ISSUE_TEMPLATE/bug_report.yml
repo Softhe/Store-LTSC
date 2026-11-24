@@ -1,0 +1,62 @@
+name: Bug report
+description: The installer failed, or Microsoft Store or winget does not work after installing.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. A diagnostics zip answers most questions at once. Collect it on the affected PC by running this in PowerShell:
+
+        ```powershell
+        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Softhe/Store-LTSC/main/install.ps1))) -CollectLogs
+        ```
+
+        It installs nothing. It saves `Store-LTSC-diagnostics-<date>.zip` and prints its full path at the end. That is usually your desktop. With `-LogDir` it is that folder, and when there is no desktop (for example when run as SYSTEM) it is `%TEMP%\StoreInstall-Logs`. The zip holds system details, service states, policies, the installed Store packages, recent AppX deployment errors and the last installer logs. User, computer and domain names are replaced with placeholders. Look through the files before you attach the zip.
+  - type: input
+    id: windows
+    attributes:
+      label: Windows edition and build
+      description: Shown at the top of the installer output, or run `winver`.
+      placeholder: Windows 10 IoT Enterprise LTSC 2021, build 19044.1288
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How did you run the installer?
+      options:
+        - The irm | iex command
+        - Install-Store.cmd
+        - Offline folder (-Source Local)
+        - As SYSTEM (Intune, SCCM, MDT, a scheduled task)
+        - Other (explain below)
+    validations:
+      required: true
+  - type: input
+    id: exit-code
+    attributes:
+      label: Exit code
+      description: The last lines of the installer output show it.
+      placeholder: '5'
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead? Paste the installer output if you have it.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics zip
+      description: Drag the zip from -CollectLogs here. If you cannot run it, attach the installer log (its path is printed at the end of each run).
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I restarted Windows after installing and tried again.
+        - label: I ran the newest version of the installer.

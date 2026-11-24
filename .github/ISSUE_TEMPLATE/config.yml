@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/Softhe/Store-LTSC#logs-and-troubleshooting
+    about: Common problems, exit codes and where the logs are.
