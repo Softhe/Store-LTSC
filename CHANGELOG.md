@@ -6,7 +6,7 @@ Each release is a Git tag `v<version>` that matches `$StoreLtscVersion` in `inst
 irm https://raw.githubusercontent.com/Softhe/Store-LTSC/v1.0.0/install.ps1 | iex
 ```
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-11-24
 
 The first tagged release. It contains everything the script did before releases existed, plus the changes below.
 
