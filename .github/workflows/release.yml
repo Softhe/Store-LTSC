@@ -18,7 +18,7 @@ jobs:
       matrix:
         engine: [powershell, pwsh]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run isolated installer tests
         shell: pwsh
         run: |
@@ -31,7 +31,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the version and write the release notes
         shell: pwsh
